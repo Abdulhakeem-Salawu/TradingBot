@@ -1,0 +1,16 @@
+# One persistent wineserver for the MT5 prefix, in its own unit, so that
+# restarting the terminal or the bridge does not take the other one down.
+[Unit]
+Description=MT5 wineserver
+After=mt5-xvfb.service
+Requires=mt5-xvfb.service
+
+[Service]
+User=@USER@
+Environment=WINEPREFIX=@HOME@/.mt5 WINEDEBUG=-all DISPLAY=:99
+ExecStart=/usr/bin/wineserver --foreground --persistent
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+# Tested with Python 3.11 and the versions below (September 2026).
+numpy>=2.4,<3
+pandas>=3.0,<4
+scikit-learn>=1.9,<2
+scipy>=1.17,<2
+pyarrow>=25.0
+requests>=2.34,<3
+rpyc>=6.0,<7            # MT5_BACKEND=wine: talks to MetaTrader5 running under Wine (live/mt5_bridge.py)

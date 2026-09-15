@@ -1,0 +1,18 @@
+# The MetaTrader 5 terminal under Wine. It reconnects to the last account it
+# was logged into; the first login happens through the bridge (MT5_LOGIN,
+# MT5_PASSWORD, MT5_SERVER in .env) -- see deploy/LINUX_WINE_MT5.md.
+[Unit]
+Description=MT5 terminal (Wine)
+After=mt5-wineserver.service
+Requires=mt5-wineserver.service
+
+[Service]
+User=@USER@
+Environment=WINEPREFIX=@HOME@/.mt5 WINEDEBUG=-all DISPLAY=:99
+ExecStart=/usr/bin/wine "@HOME@/.mt5/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+Restart=always
+RestartSec=30
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

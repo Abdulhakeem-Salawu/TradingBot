@@ -1,0 +1,22 @@
+# MT5 base image: wine-base + the prefix uploaded by the job signal-bot-bake.
+# Run it right after the bake (setup.sh does both). The archive is deleted
+# once the image is pushed.
+#   gcloud builds submit --region=us-central1 --config=deploy/cloudrun/cloudbuild-mt5.yaml .
+steps:
+  - name: gcr.io/cloud-builders/gcloud
+    args: ["storage", "cp", "${_PREFIX_ARCHIVE}", "deploy/cloudrun/mt5-prefix.tar.gz"]
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "deploy/cloudrun/Dockerfile.mt5",
+           "--build-arg", "WINE_IMAGE=${_REPO}/wine-base:latest",
+           "-t", "${_REPO}/mt5-base:${BUILD_ID}", "-t", "${_REPO}/mt5-base:latest", "."]
+  - name: gcr.io/cloud-builders/docker
+    args: ["push", "--all-tags", "${_REPO}/mt5-base"]
+  - name: gcr.io/cloud-builders/gcloud
+    args: ["storage", "rm", "${_PREFIX_ARCHIVE}"]
+substitutions:
+  _REPO: us-central1-docker.pkg.dev/${PROJECT_ID}/signal-bot
+  _PREFIX_ARCHIVE: gs://${PROJECT_ID}-signal-bot/build/mt5-prefix.tar.gz
+options:
+  logging: CLOUD_LOGGING_ONLY
+  dynamicSubstitutions: true
+timeout: 1800s

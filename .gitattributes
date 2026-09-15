@@ -1,0 +1,3 @@
+# Keep LF in the working copy on Windows too: the scripts and Dockerfiles run in
+# Linux containers, and `gcloud builds submit` uploads the working copy as it is.
+* text=auto eol=lf

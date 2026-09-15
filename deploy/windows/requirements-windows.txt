@@ -1,0 +1,3 @@
+# The bot's requirements plus the official MetaTrader 5 library (Windows only).
+-r ../../requirements.txt
+MetaTrader5>=5.0.6180

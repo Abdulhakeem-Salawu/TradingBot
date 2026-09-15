@@ -1,0 +1,19 @@
+# live/mt5_bridge.py in the Windows Python inside Wine: exposes the
+# MetaTrader5 package to the bot's Linux Python on 127.0.0.1:8001 only.
+# Never open this port in a firewall -- whoever reaches it can trade.
+[Unit]
+Description=MT5 Python bridge (Wine, 127.0.0.1:8001)
+After=mt5-terminal.service
+Requires=mt5-wineserver.service
+Wants=mt5-terminal.service
+
+[Service]
+User=@USER@
+WorkingDirectory=@ROOT@
+Environment=WINEPREFIX=@HOME@/.mt5 WINEDEBUG=-all DISPLAY=:99
+ExecStart=/usr/bin/wine "@HOME@/.mt5/drive_c/Python311/python.exe" -u live/mt5_bridge.py --port 8001
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

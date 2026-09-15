@@ -1,0 +1,16 @@
+# Wine base image (no MetaTrader). A few minutes.
+#   gcloud builds submit --region=us-central1 --config=deploy/cloudrun/cloudbuild-wine.yaml .
+#   ... --substitutions=_WINE_BRANCH=stable   to try another Wine branch
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "deploy/cloudrun/Dockerfile.wine",
+           "--build-arg", "WINE_BRANCH=${_WINE_BRANCH}",
+           "-t", "${_IMAGE}:wine-${_WINE_BRANCH}", "-t", "${_IMAGE}:latest", "."]
+images: ["${_IMAGE}:wine-${_WINE_BRANCH}", "${_IMAGE}:latest"]
+substitutions:
+  _WINE_BRANCH: staging
+  _IMAGE: us-central1-docker.pkg.dev/${PROJECT_ID}/signal-bot/wine-base
+options:
+  logging: CLOUD_LOGGING_ONLY
+  dynamicSubstitutions: true
+timeout: 1800s

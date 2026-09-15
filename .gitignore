@@ -1,0 +1,22 @@
+# Credentials and machine-specific settings (templates: .env.example, deploy/windows/env.windows.example)
+.env
+.env.*
+!.env.example
+
+# Runtime state, price caches, models and logs: they live on the PC or in Cloud Storage
+data/
+state/
+models/
+logs/
+*.db
+*.db-wal
+*.db-shm
+*.lock
+*.tar.gz
+*.parquet
+
+# Python
+.venv*/
+venv/
+__pycache__/
+*.pyc

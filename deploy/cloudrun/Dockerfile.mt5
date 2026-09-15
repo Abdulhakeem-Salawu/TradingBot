@@ -1,0 +1,10 @@
+# MetaTrader 5 and Windows Python under Wine, headless: the slow, rarely
+# changing part of the Cloud Run image. wine-base plus the Wine prefix that the
+# job signal-bot-bake installed and uploaded (deploy/cloudrun/cloudbuild-mt5.yaml
+# downloads it next to this file). The bot itself is layered on top by
+# deploy/cloudrun/Dockerfile.
+ARG WINE_IMAGE
+FROM ${WINE_IMAGE}
+
+# ADD unpacks the archive: /opt/mt5
+ADD deploy/cloudrun/mt5-prefix.tar.gz /opt/

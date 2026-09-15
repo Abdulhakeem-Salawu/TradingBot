@@ -1,0 +1,29 @@
+# Wine on a virtual screen, no MetaTrader yet (deploy/cloudrun/cloudbuild-wine.yaml).
+#
+# MetaTrader 5 cannot be installed here: its copy protection reports "a
+# debugger has been found" under Wine on Linux kernels older than 5.11, and
+# Cloud Build workers run 5.10. Cloud Run (6.x) is fine, so the job
+# signal-bot-bake installs MT5 on this image (bake_mt5.sh) and
+# Dockerfile.mt5 adds the result as the next layer.
+FROM debian:bookworm-slim
+
+# stable, staging or devel: the WineHQ branch. MT5 was tested on staging 11.10.
+ARG WINE_BRANCH=staging
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    WINEPREFIX=/opt/mt5 \
+    WINEARCH=win64 \
+    WINEDEBUG=-all
+
+RUN dpkg --add-architecture i386 \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl gnupg xvfb xauth x11-utils x11-apps netpbm cabextract procps pigz \
+ && mkdir -pm755 /etc/apt/keyrings \
+ && curl -fsSL https://dl.winehq.org/wine-builds/winehq.key | gpg --dearmor -o /etc/apt/keyrings/winehq-archive.key \
+ && curl -fsSL -o /etc/apt/sources.list.d/winehq-bookworm.sources \
+      https://dl.winehq.org/wine-builds/debian/dists/bookworm/winehq-bookworm.sources \
+ && apt-get update \
+ && apt-get install -y --install-recommends winehq-${WINE_BRANCH} \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY deploy/cloudrun/install_mt5.sh deploy/cloudrun/bake_mt5.sh /opt/

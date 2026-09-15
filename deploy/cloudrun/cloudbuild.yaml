@@ -1,0 +1,16 @@
+# Bot image on top of the MT5 base image. A few minutes.
+#   gcloud builds submit --region=us-central1 --config=deploy/cloudrun/cloudbuild.yaml .
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "deploy/cloudrun/Dockerfile",
+           "--build-arg", "BASE_IMAGE=${_BASE_IMAGE}",
+           "-t", "${_IMAGE}:${_TAG}", "-t", "${_IMAGE}:latest", "."]
+images: ["${_IMAGE}:${_TAG}", "${_IMAGE}:latest"]
+substitutions:
+  _BASE_IMAGE: us-central1-docker.pkg.dev/${PROJECT_ID}/signal-bot/mt5-base:latest
+  _IMAGE: us-central1-docker.pkg.dev/${PROJECT_ID}/signal-bot/bot
+  _TAG: manual
+options:
+  logging: CLOUD_LOGGING_ONLY
+  dynamicSubstitutions: true
+timeout: 1800s

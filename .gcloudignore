@@ -1,0 +1,11 @@
+# What `gcloud builds submit` may upload: only what the Cloud Run images need.
+# Never .env files, data/, state/, logs/ or the Windows venv.
+/*
+!/deploy/
+/deploy/*
+!/deploy/cloudrun/
+!/harness/
+!/live/
+!/requirements.txt
+__pycache__/
+*.pyc
