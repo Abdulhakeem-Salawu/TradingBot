@@ -8,6 +8,8 @@
     python -m live.cloud_run reset-feed     # once, after changing MT5 server: archive, then drop
                                             # other servers' prices and models and the FX/gold
                                             # paper records, so nothing from the old feed remains
+    python -m live.cloud_run holdout        # once, when tuning is done: score the reserved slice
+                                            # (ML_HOLDOUT_FROM) that no training run has read
 
 hourly:
   1. take the state lease and restore data/, state/, models/ from STATE_URI
@@ -597,6 +599,14 @@ def hourly_work(root: Path, now: datetime, clock: Clock) -> int:
     return rc
 
 
+def holdout_work(root: Path, now: datetime, clock: Clock) -> int:
+    rc = subprocess.run([sys.executable, "-m", "live.ml_job", "holdout", "--offline"]).returncode
+    if rc:
+        problem(f"holdout scoring (exit {rc})", echo=False)
+    clock.lap("score holdout")
+    return rc
+
+
 def retrain_work(root: Path, now: datetime, clock: Clock) -> int:
     rc = subprocess.run([sys.executable, "-m", "live.ml_job", "train", "--offline"]).returncode
     if rc:
@@ -673,6 +683,10 @@ def hourly() -> int:
 
 def retrain() -> int:
     return with_state("retrain", retrain_work, float(os.environ.get("RETRAIN_WAIT_SECONDS", "900")))
+
+
+def score_holdout() -> int:
+    return with_state("holdout", holdout_work, float(os.environ.get("RETRAIN_WAIT_SECONDS", "900")))
 
 
 def probe() -> int:
@@ -791,7 +805,7 @@ def main(argv=None) -> int:
     task = (argv if argv is not None else sys.argv[1:] or ["hourly"])[0]
     load_secrets()
     tasks = {"hourly": hourly, "retrain": retrain, "probe": probe, "telegram": telegram,
-             "save-secrets": save_secrets, "reset-feed": reset_feed}
+             "save-secrets": save_secrets, "reset-feed": reset_feed, "holdout": score_holdout}
     if task not in tasks:
         print(f"unknown task {task!r}: choose from {', '.join(tasks)}")
         return 2

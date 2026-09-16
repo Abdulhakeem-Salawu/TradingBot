@@ -1027,6 +1027,41 @@ def main() -> int:
         except ValueError:
             check(True, "FX model without MT5_SERVER: refuses to guess the feed")
 
+        # --- the reserved holdout ---
+        from live.ml_job import holdout_one, holdout_start, split_at_holdout, training_frame
+
+        hsyn = synthetic_with_edge(6000, seed=7)
+        hframe = training_frame(hsyn, btc.costs, 6)
+        boundary = hframe.index[int(len(hframe) * 0.8)]
+        os.environ["ML_HOLDOUT_FROM"] = str(boundary.date())
+        bound = holdout_start()
+
+        n_train = split_at_holdout(hframe.index, bound, 6)
+        before = int((hframe.index < bound).sum())
+        check(n_train == before - 6,
+              "holdout: the label window before the boundary is purged from training")
+
+        hmodels = str(tmp / "holdout-models")
+        line = train_one(btc, "1h", 6, hsyn, hmodels, n_models=1, feed="binance")
+        _, hmeta = model_paths(hmodels, "binance", btc.symbol, "1h", 6)
+        info = json.loads(hmeta.read_text())
+        check(info["holdout_from"] == str(bound) and "held back" in line,
+              "holdout: the boundary is recorded next to the model")
+        check(pd.Timestamp(info["trained_until"]) < bound and info["rows"] == n_train,
+              "holdout: no training row reaches the boundary")
+
+        scored = holdout_one(btc, "1h", 6, hsyn, hmodels, "binance", n_models=1)
+        check("holdout bars" in scored and str(bound.date()) in scored,
+              "holdout: the reserved slice scores against the shipped model")
+
+        os.environ["ML_HOLDOUT_FROM"] = str((boundary + pd.Timedelta(days=1)).date())
+        moved = holdout_one(btc, "1h", 6, hsyn, hmodels, "binance", n_models=1)
+        check("retrain before scoring" in moved,
+              "holdout: a model reserved for another boundary is refused, not silently scored")
+        os.environ.pop("ML_HOLDOUT_FROM")
+        check(split_at_holdout(hframe.index, holdout_start(), 6) == len(hframe),
+              "holdout: unset reserves nothing, so existing behaviour is unchanged")
+
         old_db = tmp / "old-ledger.db"
         con = sqlite3.connect(old_db)
         con.executescript(
