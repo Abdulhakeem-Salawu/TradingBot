@@ -3,6 +3,8 @@
     python -m live.cloud_run hourly   # the scheduled run (default)
     python -m live.cloud_run retrain  # weekly: retrain the models on the cached prices (no MT5)
     python -m live.cloud_run probe    # start MT5 and report what the bot can see; saves nothing
+    python -m live.cloud_run telegram # check the Telegram bot, find the chat id, send a test message
+    python -m live.cloud_run save-secrets   # copy this run's MT5/Telegram settings into SECRETS_URI
 
 hourly:
   1. take the state lease and restore data/, state/, models/ from STATE_URI
@@ -28,12 +30,20 @@ Settings come from the job's environment -- there is no .env file here:
   STATE_URI          gs://bucket/prefix (required for hourly)
   JOBS               strategy:universe:timeframe list (default: live.run_jobs)
   FX_DATA_SOURCE     mt5 (default here) or dukascopy
-  MT5_LOGIN / MT5_SERVER, and MT5_PASSWORD from Secret Manager
+  MT5_LOGIN / MT5_SERVER / MT5_PASSWORD, and TELEGRAM_TOKEN / TELEGRAM_CHAT_ID:
+                     from the job, or from SECRETS_URI (gs://bucket/secrets, a file in
+                     the bot's own bucket -- Secret Manager charges past six versions)
   MT5_READY_SECONDS  how long to wait for the terminal (default 240)
   COMPARE_HOUR_UTC   hour whose run also sends the comparison (default 23)
   EXECUTOR_ENABLED   true to let this run trade demo/live slots (default false)
+  EXECUTOR_DRY_RUN   true: start the terminal as for trading and print the orders
+                     a sync would send, without sending any (overrides EXECUTOR_ENABLED)
   MT5_MAX_BARS       bars per chart the terminal keeps: auto (default) is 10000,
                      or 100000 for a run that must download a whole history
+  TELEGRAM_TOKEN     from Secret Manager, and TELEGRAM_CHAT_ID: where reports go. A run
+                     with problems (MT5 not ready, a failed job, state not saved,
+                     skipped for a lease) sends one alert
+  NOTIFY_PAPER       paper job messages: problems (set on the job), changes, always, never
   MEMORY_REPORT_AT   memory fractions at which to log the biggest processes and
                      files (default 0.7,0.9)
 """
@@ -75,6 +85,73 @@ def _defaults() -> None:
     os.environ.setdefault("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", r"C:\missing-webview2")
     os.environ["WINEPREFIX"] = WINEPREFIX
     os.environ["DISPLAY"] = DISPLAY
+
+
+SECRET_KEYS = ("MT5_LOGIN", "MT5_SERVER", "MT5_PASSWORD", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID")
+SECRETS_OBJECT = "bot.env"
+
+
+def parse_secrets(text: str) -> dict[str, str]:
+    """KEY=value lines (like .env) -> the settings this bot accepts, others ignored."""
+    values = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        if key in SECRET_KEYS and value:
+            values[key] = value
+    return values
+
+
+def load_secrets() -> None:
+    """Read SECRETS_URI (a private object in the bot's own bucket) into the environment.
+
+    Secret Manager charges for every active version beyond the free six, and this
+    project is past that, so the password and the Telegram token live in the state
+    bucket instead. Anything already set by Secret Manager (MT5_PASSWORD=...) wins,
+    so both ways work. Values are never printed.
+    """
+    uri = os.environ.get("SECRETS_URI")
+    if not uri:
+        return
+    from live import cloud_state
+
+    try:
+        blob, _ = cloud_state.open_store(uri).read(SECRETS_OBJECT)
+    except Exception as e:  # noqa: BLE001 -- a missing file must not stop the run
+        print(f"settings file {uri}/{SECRETS_OBJECT} not read: {type(e).__name__}")
+        return
+    if blob is None:
+        print(f"no settings file yet at {uri}/{SECRETS_OBJECT}")
+        return
+    loaded = [key for key, value in parse_secrets(blob.decode("utf-8", "replace")).items()
+              if os.environ.setdefault(key, value) == value]
+    print(f"settings from {uri}/{SECRETS_OBJECT}: {', '.join(loaded) or 'none used'}")
+
+
+def save_secrets() -> int:
+    """Write the settings this run was given into SECRETS_URI, so Secret Manager
+    versions can be destroyed. Prints only the key names."""
+    uri = os.environ.get("SECRETS_URI")
+    if not uri:
+        print("SECRETS_URI is not set (gs://bucket/secrets)")
+        return 2
+    from live import cloud_state
+
+    store = cloud_state.open_store(uri)
+    blob, generation = store.read(SECRETS_OBJECT)
+    values = parse_secrets(blob.decode("utf-8", "replace")) if blob else {}
+    values.update({key: os.environ[key] for key in SECRET_KEYS if os.environ.get(key)})
+    if not values:
+        print("nothing to save: none of " + ", ".join(SECRET_KEYS) + " is set on this job")
+        return 1
+    text = "# Settings for the signal bot, read at the start of every run (live/cloud_run.py).\n"
+    text += "".join(f"{key}={values[key]}\n" for key in SECRET_KEYS if key in values)
+    store.write(SECRETS_OBJECT, text.encode("utf-8"), generation)
+    print(f"saved to {uri}/{SECRETS_OBJECT}: {', '.join(values)}")
+    return 0
 
 
 class Clock:
@@ -379,10 +456,37 @@ def _print_logs(logs: Path) -> None:
         print(log.read_text(encoding="utf-8", errors="replace").rstrip())
 
 
+PROBLEMS: list[str] = []   # what went wrong in this run, sent as one alert at its end
+
+
+def problem(text: str, echo: bool = True) -> None:
+    if echo:
+        print(text)
+    PROBLEMS.append(text)
+
+
+def alert(owner: str, now: datetime, rc: int) -> None:
+    """One Telegram message for a run that had problems (live/notify.py; printed only
+    while no bot is set up). A run killed outright cannot send one."""
+    if not PROBLEMS and rc == 0:
+        return
+    lines = PROBLEMS or [f"finished with exit code {rc}"]
+    text = "\n".join([f"Cloud Run {owner} ({now:%Y-%m-%d %H:%M} UTC) had problems:"]
+                     + [f"- {line}" for line in lines[:10]]
+                     + [f"Logs: Cloud Run > Jobs > {os.environ.get('CLOUD_RUN_JOB', 'signal-bot')} > Logs"])
+    try:
+        from live.notify import send
+
+        send(text)
+    except Exception as e:  # noqa: BLE001 -- an alert must never break the run
+        print(f"alert not sent: {type(e).__name__}")
+
+
 def with_state(label: str, work, wait_seconds: float = 0) -> int:
     """Lease + restore the state, run work(root, now, clock), save + release. Returns work's code."""
     from live import cloud_state
 
+    PROBLEMS.clear()
     uri = os.environ.get("STATE_URI")
     if not uri:
         print("STATE_URI is not set (gs://bucket/prefix)")
@@ -402,7 +506,8 @@ def with_state(label: str, work, wait_seconds: float = 0) -> int:
             break
         except cloud_state.StateConflict as e:
             if time.monotonic() >= deadline:
-                print(f"not running: {e}")
+                problem(f"not running: {e}")
+                alert(owner, now, 0)
                 return 0
             time.sleep(30)
     clock.lap("restore state")
@@ -411,9 +516,9 @@ def with_state(label: str, work, wait_seconds: float = 0) -> int:
     try:
         rc = work(root, now, clock)
     except Exception as e:  # noqa: BLE001 -- still save what was done
-        print(f"run failed: {type(e).__name__}: {e}")
+        problem(f"run failed: {type(e).__name__}: {e}")
     except Terminated as e:
-        print(f"run stopped ({e}): saving what was done")
+        problem(f"run stopped ({e}, a timeout or a cancel): saving what was done")
         rc = 143
     finally:
         try:
@@ -421,11 +526,12 @@ def with_state(label: str, work, wait_seconds: float = 0) -> int:
             if label == "hourly" and now.hour == int(os.environ.get("COMPARE_HOUR_UTC", "23")):
                 cloud_state.backup(store, data, f"{now:%Y-%m-%d}")
         except cloud_state.StateConflict as e:
-            print(f"STATE NOT SAVED: {e}")
+            problem(f"STATE NOT SAVED: {e}")
             rc = 1
         finally:
             cloud_state.release(session)
         clock.lap("save state")
+    alert(owner, now, rc)
     return rc
 
 
@@ -434,7 +540,8 @@ def hourly_work(root: Path, now: datetime, clock: Clock) -> int:
 
     rc, stack, ready = 0, None, False
     jobs = parse_jobs(os.environ.get("JOBS") or DEFAULT_JOBS)
-    trading = os.environ.get("EXECUTOR_ENABLED", "").lower() == "true"
+    dry_run = os.environ.get("EXECUTOR_DRY_RUN", "").lower() == "true"
+    trading = os.environ.get("EXECUTOR_ENABLED", "").lower() == "true" or dry_run
     try:
         if os.environ.get("FX_DATA_SOURCE", "mt5").lower() == "mt5" or trading:
             stack = MT5Stack()
@@ -445,6 +552,7 @@ def hourly_work(root: Path, now: datetime, clock: Clock) -> int:
                 detail = str(e)
             print(f"MT5 {'ready' if ready else 'NOT READY'}: {detail}")
             if not ready:
+                problem(f"MT5 not ready, FX and gold jobs skipped: {detail}", echo=False)
                 print(stack.diagnostics())
                 rc = 1
             clock.lap("start MT5")
@@ -455,18 +563,27 @@ def hourly_work(root: Path, now: datetime, clock: Clock) -> int:
         compare = now.hour == int(os.environ.get("COMPARE_HOUR_UTC", "23"))
         logs = root / "logs"
         shutil.rmtree(logs, ignore_errors=True)
-        rc |= run(runnable, env_file=str(root / ".env"), compare=compare)
+        failed: list[str] = []
+        rc |= run(runnable, env_file=str(root / ".env"), compare=compare, failed=failed)
+        for name in failed:
+            problem(f"paper job {name}", echo=False)
         _print_logs(logs)
         clock.lap("paper jobs" + (" + comparison" if compare else ""))
 
         if any((root / "models").glob("*.pkl")):
-            rc |= subprocess.run([sys.executable, "-m", "live.ml_job", "predict"]).returncode
+            code = subprocess.run([sys.executable, "-m", "live.ml_job", "predict"]).returncode
+            if code:
+                problem(f"model predictions (exit {code})", echo=False)
+            rc |= code
             clock.lap("predictions")
 
         if trading and ready:
-            rc |= subprocess.run([sys.executable, "-m", "live.mt5_executor",
-                                  "--targets-source", "ledger"]).returncode
-            clock.lap("executor sync")
+            code = subprocess.run([sys.executable, "-m", "live.mt5_executor", "--targets-source", "ledger"]
+                                  + (["--dry-run"] if dry_run else [])).returncode
+            if code:
+                problem(f"MT5 executor (exit {code})", echo=False)
+            rc |= code
+            clock.lap("executor dry run" if dry_run else "executor sync")
     finally:
         if stack is not None:
             stack.stop()
@@ -475,6 +592,8 @@ def hourly_work(root: Path, now: datetime, clock: Clock) -> int:
 
 def retrain_work(root: Path, now: datetime, clock: Clock) -> int:
     rc = subprocess.run([sys.executable, "-m", "live.ml_job", "train", "--offline"]).returncode
+    if rc:
+        problem(f"model training (exit {rc})", echo=False)
     clock.lap("train models")
     return rc
 
@@ -530,6 +649,62 @@ def probe() -> int:
     return 0 if ok else 1
 
 
+def chats_from_updates(updates) -> list[tuple[int, str, str]]:
+    """(chat id, type, name) of each chat that has written to the bot, most recent last."""
+    chats: dict[int, tuple[int, str, str]] = {}
+    for update in updates:
+        message = next((update[k] for k in ("message", "edited_message", "channel_post", "my_chat_member")
+                        if isinstance(update.get(k), dict)), {})
+        chat = message.get("chat") or {}
+        if "id" not in chat:
+            continue
+        name = chat.get("title") or " ".join(filter(None, (chat.get("first_name"), chat.get("last_name"))))
+        if chat.get("username"):
+            name = f"{name} (@{chat['username']})".strip()
+        earlier = chats.pop(chat["id"], None)
+        chats[chat["id"]] = (chat["id"], chat.get("type", "?"), max(name, earlier[2] if earlier else "", key=len))
+    return list(chats.values())
+
+
+def telegram() -> int:
+    """Check the Telegram set-up: the bot's name, the chats that have written to it
+    (to find TELEGRAM_CHAT_ID), and a test message once TELEGRAM_CHAT_ID is set.
+    Never prints the token (it is part of every Telegram URL)."""
+    import requests
+
+    token = os.environ.get("TELEGRAM_TOKEN")
+    if not token:
+        print("TELEGRAM_TOKEN is not set: add the bot token as a version of the "
+              "signal-bot-telegram-token secret, then run: bash deploy/cloudrun/setup.sh job")
+        return 2
+    api = f"https://api.telegram.org/bot{token}"
+    try:
+        me = requests.get(f"{api}/getMe", timeout=20).json()
+        updates = requests.get(f"{api}/getUpdates", timeout=20).json() if me.get("ok") else {}
+    except (requests.RequestException, ValueError) as e:
+        print(f"Telegram did not answer: {type(e).__name__}")
+        return 1
+    if not me.get("ok"):
+        print(f"Telegram refused the token: {me.get('description', 'unknown error')}")
+        return 1
+    print(f"bot: @{me['result'].get('username')}")
+    chats = chats_from_updates(updates.get("result", []))
+    if chats:
+        print("chats that wrote to the bot (most recent last):")
+        for chat_id, kind, name in chats:
+            print(f"  TELEGRAM_CHAT_ID={chat_id}   {kind}: {name}")
+    else:
+        print("nobody has written to the bot yet: open it in Telegram, press Start, then run this again")
+    if not os.environ.get("TELEGRAM_CHAT_ID"):
+        return 0
+    from live.notify import send
+
+    ok = send(f"Signal bot connected: reports from Cloud Run ({os.environ.get('CLOUD_RUN_JOB', 'signal-bot')}) "
+              f"will arrive in this chat.")
+    print("test message sent" if ok else "test message NOT sent (see above)")
+    return 0 if ok else 1
+
+
 class Terminated(BaseException):
     """SIGTERM: Cloud Run cancelled the execution or hit the task timeout. It
     allows 10 seconds before killing the container -- enough to save the state
@@ -545,7 +720,9 @@ def main(argv=None) -> int:
     _defaults()
     signal.signal(signal.SIGTERM, _on_sigterm)
     task = (argv if argv is not None else sys.argv[1:] or ["hourly"])[0]
-    tasks = {"hourly": hourly, "retrain": retrain, "probe": probe}
+    load_secrets()
+    tasks = {"hourly": hourly, "retrain": retrain, "probe": probe, "telegram": telegram,
+             "save-secrets": save_secrets}
     if task not in tasks:
         print(f"unknown task {task!r}: choose from {', '.join(tasks)}")
         return 2

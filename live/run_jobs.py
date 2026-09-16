@@ -72,7 +72,9 @@ def _release_lock(handle) -> None:
     handle.close()
 
 
-def run(jobs, env_file: str, compare: bool, python: str = sys.executable) -> int:
+def run(jobs, env_file: str, compare: bool, python: str = sys.executable,
+        failed: list | None = None) -> int:
+    """Run each job in turn; names of jobs that did not finish cleanly go to `failed`."""
     Path("logs").mkdir(exist_ok=True)
     print(f"== {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC")
     failures = 0
@@ -94,6 +96,8 @@ def run(jobs, env_file: str, compare: bool, python: str = sys.executable) -> int
         secs = (datetime.now(timezone.utc) - started).total_seconds()
         print(f"{name:<22} {'ok' if rc == 0 else f'exit {rc}'}  ({secs:.0f}s, logs/{name}.log)")
         failures += rc != 0
+        if rc != 0 and failed is not None:
+            failed.append(f"{name} ({'timed out' if rc == -1 else f'exit {rc}'})")
     if compare:
         with open(Path("logs") / "compare.log", "a", encoding="utf-8") as log:
             log.write(f"\n===== {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC =====\n")
@@ -102,6 +106,8 @@ def run(jobs, env_file: str, compare: bool, python: str = sys.executable) -> int
                                 stdout=log,
                                 stderr=subprocess.STDOUT).returncode
         print(f"{'compare':<22} {'ok' if rc == 0 else f'exit {rc}'}  (logs/compare.log)")
+        if rc != 0 and failed is not None:
+            failed.append(f"daily comparison (exit {rc})")
     return 1 if failures else 0
 
 

@@ -646,6 +646,18 @@ def main() -> int:
             check(True, "bar limit too short to reach the cached bars: refuses rather than leave a gap")
         dm.maxbars = 100_000
         import live.mt5_data as mt5_data
+        os.environ["MT5_SERVER_TZ"] = "ny+7"
+        cli_mt5 = FakeMT5()                 # every FX symbol, with the broker's "m" suffix
+        cli_mt5.rates, cli_mt5.server_time = dm.rates, dm.server_time
+        mt5_data._session["mt5"] = cli_mt5
+        try:
+            cli_rc = mt5_data.main(["fx", "--years", "3", "--cache-dir", str(tmp / "mt5cli"),
+                                    "--passes", "1", "--env-file", str(tmp / "no.env")])
+        finally:
+            mt5_data._session["mt5"] = None
+            os.environ.pop("MT5_SERVER_TZ")
+        check(cli_rc == 0 and len(list((tmp / "mt5cli").glob("mt5_Fake-Demo_*_H1.parquet"))) == 7,
+              "PC history download: caches for every FX symbol, reported complete")
         retry_wait, mt5_data.HISTORY_RETRY_SECONDS = mt5_data.HISTORY_RETRY_SECONDS, 0
         try:
             dm.loading_answers = 2
@@ -790,6 +802,95 @@ def main() -> int:
         check(rc == 143 and stopped_store.read(cloud_state.LEASE)[0] is None
               and "state/done.txt" in saved_names,
               "cancelled run (SIGTERM): saves what was done and releases the lease")
+
+        add_store = cloud_state.FileStore(str(tmp / "add-bucket"))
+        add_root = tmp / "add-pc"
+        (add_root / "data").mkdir(parents=True)
+        (add_root / "data" / "mt5_X_EUR_USD_H1.parquet").write_bytes(b"20 years")
+        try:
+            cloud_state.add_files(add_store, [add_root / "data" / "mt5_X_EUR_USD_H1.parquet"], add_root,
+                                  "pc", wait_seconds=0)
+            check(False, "adding to a location with no saved state must be refused")
+        except cloud_state.StateConflict:
+            pass
+        first = cloud_state.acquire(add_store, tmp / "add-run", "run-1", timedelta(minutes=40))
+        (tmp / "add-run" / "state").mkdir(parents=True, exist_ok=True)
+        (tmp / "add-run" / "state" / "keep.txt").write_text("ledger")
+        cloud_state.save(first)
+        try:
+            cloud_state.add_files(add_store, [add_root / "data" / "mt5_X_EUR_USD_H1.parquet"], add_root,
+                                  "pc", wait_seconds=0)
+            check(False, "a held lease must stop the upload")
+        except cloud_state.StateConflict:
+            pass
+        cloud_state.release(first)
+        added = cloud_state.add_files(add_store, [add_root / "data" / "mt5_X_EUR_USD_H1.parquet"],
+                                      add_root, "pc", wait_seconds=0)
+        add_blob, _ = add_store.read(cloud_state.BUNDLE)
+        add_names = tarfile.open(fileobj=io.BytesIO(add_blob), mode="r:gz").getnames()
+        check(added == ["data/mt5_X_EUR_USD_H1.parquet"] and "data/mt5_X_EUR_USD_H1.parquet" in add_names
+              and "state/keep.txt" in add_names and add_store.read(cloud_state.LEASE)[0] is None,
+              "PC upload: adds files to the saved state under the lease, keeps the rest")
+
+        from live.cloud_run import SECRETS_OBJECT, load_secrets, parse_secrets, save_secrets
+        check(parse_secrets('# comment\nMT5_LOGIN=4242\nTELEGRAM_TOKEN="tok:en"\nOTHER=x\nbad line\n')
+              == {"MT5_LOGIN": "4242", "TELEGRAM_TOKEN": "tok:en"},
+              "settings file: reads the bot's own keys, ignores comments and anything else")
+        secrets_dir = tmp / "secrets-bucket"
+        os.environ.update(SECRETS_URI=f"file://{secrets_dir.as_posix()}",
+                          MT5_LOGIN="4242", TELEGRAM_TOKEN="tok")
+        try:
+            saved_rc = save_secrets()
+            written = (secrets_dir / SECRETS_OBJECT).read_text()
+            os.environ.pop("MT5_LOGIN")
+            os.environ.pop("TELEGRAM_TOKEN")
+            os.environ["MT5_SERVER"] = "Set-On-The-Job"   # Secret Manager / the job wins
+            (secrets_dir / SECRETS_OBJECT).write_text(written + "MT5_SERVER=In-The-File\n")
+            load_secrets()
+            from_file = (os.environ.get("MT5_LOGIN"), os.environ.get("TELEGRAM_TOKEN"),
+                         os.environ.get("MT5_SERVER"))
+        finally:
+            for key in ("SECRETS_URI", "MT5_LOGIN", "TELEGRAM_TOKEN", "MT5_SERVER"):
+                os.environ.pop(key, None)
+        check(saved_rc == 0 and "MT5_LOGIN=4242" in written and "TELEGRAM_TOKEN=tok" in written
+              and from_file == ("4242", "tok", "Set-On-The-Job"),
+              "settings file: saved, read back into the environment, job settings still win")
+
+        import live.notify as notify_module
+        from live.cloud_run import chats_from_updates, problem
+        from live.signal_job import should_notify
+        sent: list[str] = []
+        real_send, notify_module.send = notify_module.send, lambda text, pre=False: sent.append(text) or True
+
+        def troubled(root, now, clock):
+            problem("MT5 not ready, FX and gold jobs skipped: IPC timeout", echo=False)
+            return 1
+
+        os.environ.update(STATE_URI=f"file://{(tmp / 'alert-bucket').as_posix()}",
+                          WORK_DIR=str(tmp / "alert-work"))
+        try:
+            rc_bad = with_state("hourly", troubled)
+            after_bad = list(sent)
+            rc_good = with_state("hourly", lambda root, now, clock: 0)
+        finally:
+            os.chdir(cwd)
+            notify_module.send = real_send
+            os.environ.pop("STATE_URI")
+            os.environ.pop("WORK_DIR")
+        check(rc_bad == 1 and len(after_bad) == 1 and "MT5 not ready" in after_bad[0]
+              and rc_good == 0 and len(sent) == 1,
+              "a run with problems sends one Telegram alert; a clean run sends none")
+        check(chats_from_updates([
+            {"message": {"chat": {"id": 7, "type": "private", "first_name": "Ab", "username": "ab"}}},
+            {"message": {"chat": {"id": -5, "type": "group", "title": "Desk"}}},
+            {"my_chat_member": {"chat": {"id": 7, "type": "private", "first_name": "Ab"}}}]) ==
+              [(-5, "group", "Desk"), (7, "private", "Ab (@ab)")],
+              "telegram: chats that wrote to the bot, for TELEGRAM_CHAT_ID")
+        check([should_notify(level, True, False, False) for level in ("changes", "problems", "always", "never")]
+              == [True, False, True, False]
+              and should_notify("problems", False, True, False) and should_notify("problems", False, False, True)
+              and not should_notify("never", True, True, True),
+              "paper messages: 'problems' skips plain position changes, keeps errors and hand orders")
 
         import time
         from live.cloud_run import written_since

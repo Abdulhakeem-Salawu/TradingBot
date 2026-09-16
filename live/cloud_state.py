@@ -89,6 +89,19 @@ class FileStore:
             self._gen_path(name).unlink(missing_ok=True)
 
 
+def gcloud_token() -> tuple[str, float]:
+    """An access token from the gcloud CLI, for use outside Google Cloud."""
+    import shutil
+    import subprocess
+
+    exe = shutil.which("gcloud")
+    if exe is None:
+        raise RuntimeError("no Google Cloud credentials: not on Google Cloud and gcloud is not installed")
+    token = subprocess.run([exe, "auth", "print-access-token"], capture_output=True, text=True,
+                           check=True).stdout.strip()
+    return token, time.time() + 1800          # tokens last an hour; refresh well before
+
+
 class GcsStore:
     """Objects under gs://bucket/prefix through the JSON API."""
 
@@ -100,8 +113,11 @@ class GcsStore:
         self._token, self._token_until = None, 0.0
 
     def _metadata_token(self) -> tuple[str, float]:
-        r = self.http.get(METADATA_TOKEN, headers={"Metadata-Flavor": "Google"}, timeout=10)
-        r.raise_for_status()
+        try:
+            r = self.http.get(METADATA_TOKEN, headers={"Metadata-Flavor": "Google"}, timeout=5)
+            r.raise_for_status()
+        except requests.RequestException:
+            return gcloud_token()             # not on Google Cloud: the PC's gcloud login
         body = r.json()
         return body["access_token"], time.time() + float(body.get("expires_in", 300))
 
@@ -249,6 +265,47 @@ def release(session: Session) -> None:
     session.store.delete(LEASE, session.lease_generation)
 
 
+def add_files(store, files, root: Path, owner: str, wait_seconds: float = 900,
+              ttl: timedelta = timedelta(minutes=15)) -> list[str]:
+    """Put local files (under data/, state/ or models/ of `root`) into the saved state.
+
+    Takes the same lease as a run, waiting up to `wait_seconds` for one to finish,
+    so it never overwrites a run's work. Returns the archive paths added.
+    """
+    import shutil
+    import tempfile
+
+    root = Path(root).resolve()
+    rels = []
+    for f in files:
+        rel = Path(f).resolve().relative_to(root).as_posix()
+        if rel.split("/")[0] not in ("data", "state", "models"):
+            raise ValueError(f"{f}: only files under data/, state/ or models/ belong in the state")
+        rels.append(rel)
+    deadline = time.monotonic() + wait_seconds
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        while True:
+            try:
+                session = acquire(store, work, owner, ttl)
+                break
+            except StateConflict as e:
+                if time.monotonic() >= deadline:
+                    raise
+                print(f"waiting: {e}")
+                time.sleep(20)
+        try:
+            if not session.state_generation:
+                raise StateConflict("there is no saved state to add to at this location")
+            for rel in rels:
+                (work / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(root / rel, work / rel)
+            save(session)
+        finally:
+            release(session)
+    return rels
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Pack or unpack the bot's state archive")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -258,7 +315,21 @@ def main() -> int:
     p_unpack = sub.add_parser("unpack", help="--archive -> --root")
     p_unpack.add_argument("--archive", default=BUNDLE)
     p_unpack.add_argument("--root", default=".")
+    p_add = sub.add_parser("add", help="put local files into the saved state at --uri (waits for a running job)")
+    p_add.add_argument("--uri", required=True, help="gs://bucket/prefix, e.g. gs://PROJECT-signal-bot/prod")
+    p_add.add_argument("--root", default=".", help="project folder the files are under")
+    p_add.add_argument("files", nargs="+", help="e.g. data/mt5_Exness-MT5Real10_EUR_USD_H1.parquet")
     a = ap.parse_args()
+    if a.cmd == "add":
+        import glob
+        import socket
+
+        files = sorted({p for f in a.files for p in (glob.glob(f) or [f])})
+        added = add_files(open_store(a.uri), files, Path(a.root), f"add-files {socket.gethostname()}")
+        print(f"added {len(added)} files to {a.uri}:")
+        for rel in added:
+            print(f"  {rel}")
+        return 0
     if a.cmd == "pack":
         data = pack(Path(a.root))
         Path(a.out).write_bytes(data)

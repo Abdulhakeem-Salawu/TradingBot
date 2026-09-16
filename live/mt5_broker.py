@@ -434,4 +434,6 @@ def _parse_symbol_map(text: str) -> dict[str, str]:
 
 
 def host_label() -> str:
-    return socket.gethostname()
+    """Where a report came from. In Cloud Run the hostname is "localhost", so use
+    the job's name instead; on the PC it is the computer's name."""
+    return os.environ.get("CLOUD_RUN_JOB") or socket.gethostname()
