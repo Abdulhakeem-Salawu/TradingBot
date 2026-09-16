@@ -48,6 +48,7 @@ DEFAULT_YEARS = 3
 FRESH_TICK_SECONDS = 600    # newer than this: prices are flowing, the current hour is the edge
 REFRESH_OVERLAP = pd.Timedelta(days=7)   # cached bars re-read from MT5 on every fetch
 HISTORY_TRIES, HISTORY_RETRY_SECONDS = 8, 2.5   # while the terminal downloads a symbol's bars
+RECONNECT_WAIT, RECONNECT_POLL = 60.0, 2.0       # a terminal switching access points drops briefly
 CLOCK_TICK_SECONDS = 120    # newer than this: good enough to read the server's UTC offset
 _CLOCK_PROBES = ("EURUSD", "XAUUSD")
 _WEEKEND_PROBES = ("BTCUSD",)   # still ticks when FX and gold are closed
@@ -135,6 +136,25 @@ def _terminal(mt5=None):
     return _session["mt5"]
 
 
+def _connected_terminal(mt5):
+    """terminal_info(), waiting up to RECONNECT_WAIT for a dropped connection.
+
+    Shortly after logging in, a terminal scans the broker's access points and
+    may move to a faster one, which disconnects it for a moment; a fetch then
+    should wait rather than fail the symbol.
+    """
+    waited = 0.0
+    term = mt5.terminal_info()
+    while term is not None and not getattr(term, "connected", True):
+        if waited >= RECONNECT_WAIT:
+            raise BrokerError(f"the MT5 terminal is not connected to its broker server "
+                              f"(waited {waited:.0f}s)")
+        time.sleep(RECONNECT_POLL)
+        waited += max(RECONNECT_POLL, 0.5)
+        term = mt5.terminal_info()
+    return term
+
+
 def _server_now(mt5, names) -> int | None:
     times = []
     for name in names:
@@ -220,9 +240,7 @@ def fetch_mt5_hourly(inst: Instrument, cache_dir: str = "data", offline: bool = 
         return pd.read_parquet(found[-1]), pd.Timestamp(json.loads(marker.read_text())["complete_until"])
 
     mt5 = _terminal(mt5)
-    term = mt5.terminal_info()
-    if term is not None and not getattr(term, "connected", True):
-        raise BrokerError("the MT5 terminal is not connected to its broker server")
+    term = _connected_terminal(mt5)
     account = mt5.account_info()
     server = str(getattr(account, "server", "") or server_hint)
     cache, marker = _cache_paths(cache_dir, server, inst.symbol)

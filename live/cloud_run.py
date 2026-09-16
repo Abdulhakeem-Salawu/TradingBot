@@ -477,6 +477,7 @@ def alert(owner: str, now: datetime, rc: int) -> None:
     text = "\n".join([f"Cloud Run {owner} ({now:%Y-%m-%d %H:%M} UTC) had problems:"]
                      + [f"- {line}" for line in lines[:10]]
                      + [f"Logs: Cloud Run > Jobs > {os.environ.get('CLOUD_RUN_JOB', 'signal-bot')} > Logs"])
+    print(text)
     try:
         from live.notify import send
 

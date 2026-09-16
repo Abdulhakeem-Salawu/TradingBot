@@ -149,6 +149,7 @@ class FakeMT5:
         self.ticket = 1000
         self.maxbars = 100_000
         self.loading_answers = 0       # copy_rates_range calls that return no bars first
+        self.offline_polls = 0         # terminal_info calls that report "not connected" first
 
     def initialize(self, **kw):
         return self.init_ok
@@ -160,7 +161,9 @@ class FakeMT5:
         return (-1, "fake error")
 
     def terminal_info(self):
-        return SimpleNamespace(trade_allowed=self.trade_allowed, connected=True, maxbars=self.maxbars)
+        connected = self.offline_polls <= 0
+        self.offline_polls -= 1
+        return SimpleNamespace(trade_allowed=self.trade_allowed, connected=connected, maxbars=self.maxbars)
 
     def account_info(self):
         return SimpleNamespace(equity=self.equity, currency=self.currency, login=self.login,
@@ -658,6 +661,20 @@ def main() -> int:
             os.environ.pop("MT5_SERVER_TZ")
         check(cli_rc == 0 and len(list((tmp / "mt5cli").glob("mt5_Fake-Demo_*_H1.parquet"))) == 7,
               "PC history download: caches for every FX symbol, reported complete")
+        poll, mt5_data.RECONNECT_POLL = mt5_data.RECONNECT_POLL, 0
+        try:
+            dm.offline_polls = 3
+            fetch_mt5_hourly(universe("fx")[0], mt5dir, mt5=dm, now=july, years=5)
+            check(dm.offline_polls < 0, "terminal briefly disconnected: waits for it instead of failing")
+            dm.offline_polls = 10_000
+            try:
+                fetch_mt5_hourly(universe("fx")[0], mt5dir, mt5=dm, now=july, years=5)
+                check(False, "a terminal that stays disconnected must fail the fetch")
+            except BrokerError as e:
+                check("not connected" in str(e), "terminal stays disconnected: gives up after the wait")
+        finally:
+            mt5_data.RECONNECT_POLL = poll
+            dm.offline_polls = 0
         retry_wait, mt5_data.HISTORY_RETRY_SECONDS = mt5_data.HISTORY_RETRY_SECONDS, 0
         try:
             dm.loading_answers = 2
