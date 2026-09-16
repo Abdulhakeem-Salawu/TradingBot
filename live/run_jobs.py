@@ -72,6 +72,20 @@ def _release_lock(handle) -> None:
     handle.close()
 
 
+NOTIFY_MODES = ("changes", "always", "never")
+
+
+def notify_mode() -> str:
+    """NOTIFY_PAPER for the paper jobs: always = a report every run, changes =
+    only when a position moves or something is wrong. An unknown value falls
+    back rather than failing every job on a typo."""
+    mode = os.environ.get("NOTIFY_PAPER", "changes").strip().lower()
+    if mode not in NOTIFY_MODES:
+        print(f"NOTIFY_PAPER={mode!r} is not one of {NOTIFY_MODES}; using changes")
+        return "changes"
+    return mode
+
+
 def run(jobs, env_file: str, compare: bool, python: str = sys.executable) -> int:
     Path("logs").mkdir(exist_ok=True)
     print(f"== {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC")
@@ -85,6 +99,7 @@ def run(jobs, env_file: str, compare: bool, python: str = sys.executable) -> int
             try:
                 rc = subprocess.run([python, "-m", "live.signal_job", "--strategy", strategy,
                                      "--universe", uni, "--timeframe", timeframe,
+                                     "--notify", notify_mode(),
                                      "--env-file", env_file],
                                     stdout=log, stderr=subprocess.STDOUT,
                                     timeout=JOB_TIMEOUT_SECONDS).returncode
