@@ -14,13 +14,16 @@
 # minute and, at its time limit, a screenshot as base64 PNG ("SCREEN" lines).
 set -euo pipefail
 
-URL_MT5="https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
+# Exness's own build: a MetaQuotes-branded terminal ships only MetaQuotes
+# servers, so it cannot resolve Exness-MT5Real10 and never attempts a login.
+URL_MT5="https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe"
+MT5_NAME="MetaTrader 5 EXNESS"
 URL_WEBVIEW="https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/f2910a1e-e5a6-4f17-b52d-7faf525d17f8/MicrosoftEdgeWebview2Setup.exe"
 PY_EXE="python-3.11.9-amd64.exe"
 PY_MD5="e8dcd502e34932eebcaf1be056d5cbcd"          # python.org release page
 MT5_PY="MetaTrader5==5.0.6180"
 RPYC="rpyc==6.0.2"                                  # must match requirements.txt
-MT5_DIR="$WINEPREFIX/drive_c/Program Files/MetaTrader 5"
+MT5_DIR="$WINEPREFIX/drive_c/Program Files/$MT5_NAME"
 TERMINAL="$MT5_DIR/terminal64.exe"
 
 step() { echo; echo "== $(date -u +%H:%M:%S) $*"; }
@@ -90,7 +93,7 @@ test -f "$TERMINAL" || { echo "MetaTrader 5 did not install"; ls -la "$WINEPREFI
 
 step "first terminal start (compile bundled programs, live update)"
 # A live update restarts the terminal, so wait for the log, not the process.
-wine "C:\\Program Files\\MetaTrader 5\\terminal64.exe" >/dev/null 2>&1 &
+wine "C:\\Program Files\\$MT5_NAME\\terminal64.exe" >/dev/null 2>&1 &
 t=0
 until terminal_log_done; do
   if [ "$t" -ge 1800 ]; then echo "-- first run: no 'recompilation has been finished' after ${t}s"; screen first-run; break; fi

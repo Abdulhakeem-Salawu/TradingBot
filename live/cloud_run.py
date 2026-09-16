@@ -53,8 +53,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 WINEPREFIX = os.environ.get("WINEPREFIX", "/opt/mt5")
-TERMINAL_WIN = r"C:\Program Files\MetaTrader 5\terminal64.exe"
-TERMINAL_DIR = Path(WINEPREFIX) / "drive_c" / "Program Files" / "MetaTrader 5"
+# Broker-branded terminals install under their own name and ship only that
+# broker's servers, so the name must match the image built by install_mt5.sh.
+TERMINAL_NAME = os.environ.get("MT5_TERMINAL_NAME", "MetaTrader 5 EXNESS")
+TERMINAL_WIN = rf"C:\Program Files\{TERMINAL_NAME}\terminal64.exe"
+TERMINAL_DIR = Path(WINEPREFIX) / "drive_c" / "Program Files" / TERMINAL_NAME
 WIN_PYTHON = r"C:\Python311\python.exe"
 BRIDGE_WIN = r"Z:\app\live\mt5_bridge.py"
 DISPLAY = ":99"
