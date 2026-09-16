@@ -294,3 +294,91 @@ def fetch_mt5_hourly(inst: Instrument, cache_dir: str = "data", offline: bool = 
                                   "symbol": name, "clock": clock.scheme,
                                   "history_from": history_from}))
     return df, complete
+
+
+# ------------------------------------------------------------------ command line
+BARS_PER_YEAR = 6_300      # FX and gold trade ~24h x 5 days: about 6,200 hourly bars a year
+
+
+def main(argv=None) -> int:
+    """Download MT5 hourly history into the price caches: prices only, no ledger, no orders.
+
+    For a desktop terminal (the Windows PC), which downloads years of history in
+    minutes; Cloud Run then only ever fetches the last days of these caches.
+
+        python -m live.mt5_data --years 20            # FX and gold
+        python -m live.mt5_data fx --years 20
+    """
+    import argparse
+
+    from harness.instruments import universe
+    from live.env import load_env
+
+    ap = argparse.ArgumentParser(description="Download MT5 hourly history into the price caches "
+                                             "(prices only: no ledger, no orders)")
+    ap.add_argument("universes", nargs="*", default=["fx", "metals"])
+    ap.add_argument("--years", type=float, default=None,
+                    help="history to load (default: MT5_HISTORY_YEARS, else 3)")
+    ap.add_argument("--cache-dir", default="data")
+    ap.add_argument("--env-file", default=".env")
+    ap.add_argument("--passes", type=int, default=4,
+                    help="rounds over symbols that got no bars yet (the terminal downloads in the background)")
+    a = ap.parse_args(argv)
+    load_env(a.env_file)
+    years = float(a.years or os.environ.get("MT5_HISTORY_YEARS") or DEFAULT_YEARS)
+    insts = {i.symbol: i for u in a.universes for i in universe(u) if i.asset_class in ("fx", "metal")}
+    if not insts:
+        print("no FX or gold instruments in", a.universes)
+        return 2
+
+    mt5 = _terminal()
+    term, account = mt5.terminal_info(), mt5.account_info()
+    server = str(getattr(account, "server", "") or os.environ.get("MT5_SERVER", ""))
+    maxbars = int(getattr(term, "maxbars", 0) or 0)
+    kind = "demo" if getattr(account, "trade_mode", None) == 0 else "REAL"
+    access = "can trade" if getattr(account, "trade_allowed", False) else "read-only login"
+    print(f"terminal: {getattr(term, 'path', '?')}")
+    print(f"account: {getattr(account, 'login', '?')} on {server} ({kind} account, {access}), "
+          f"max bars in chart {maxbars:,}")
+    need = int(years * BARS_PER_YEAR)
+    if maxbars and maxbars < need:
+        print(f"\n{years:g} years need about {need:,} hourly bars, but the terminal keeps {maxbars:,}.\n"
+              f"In MT5: Tools > Options > Charts > 'Max. bars in chart' -> Unlimited (or a larger\n"
+              f"number), OK, then restart the terminal and run this again.")
+        return 2
+
+    pending = list(insts)
+    for attempt in range(1, a.passes + 1):
+        for symbol in list(pending):
+            try:
+                bars, _ = fetch_mt5_hourly(insts[symbol], a.cache_dir, years=years, mt5=mt5)
+                print(f"  {symbol:<8} {len(bars):>7,} bars  {bars.index[0]:%Y-%m-%d} .. {bars.index[-1]:%Y-%m-%d %H:%M}")
+                pending.remove(symbol)
+            except BrokerError as e:
+                print(f"  {symbol:<8} not yet: {e}")
+        if not pending or attempt == a.passes:
+            break
+        print(f"waiting 60 s for the terminal to download {', '.join(pending)} (pass {attempt} of {a.passes})")
+        time.sleep(60)
+
+    gaps = history_gaps(list(insts), a.cache_dir, server=server, years=years)
+    print(f"\ncaches in {Path(a.cache_dir).resolve()} (mt5_{server}_*):")
+    for symbol in insts:
+        marker = _cache_paths(a.cache_dir, server, symbol)[1]
+        if symbol in pending:
+            state = "FAILED: no bars (open its chart in MT5, then run this again)"
+        elif symbol in gaps:
+            state = "INCOMPLETE: history was cut, raise 'Max. bars in chart'"
+        else:
+            since = json.loads(marker.read_text()).get("history_from", "")[:10]
+            state = f"complete (asked from {since})"
+        print(f"  {symbol:<8} {state}")
+    ok = not pending and not gaps
+    print("\nall complete: ready to upload" if ok else "\nnot complete yet")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())

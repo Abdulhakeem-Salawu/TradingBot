@@ -26,6 +26,7 @@ track record is Sharpe * sqrt(years), so hourly bars do not shorten the wait.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import warnings
 from datetime import datetime, timezone
@@ -42,6 +43,19 @@ from live.executor import SLOT_UNIVERSES, execute
 from live.ledger import Ledger
 from live.notify import send
 from live.timing import is_stale
+
+
+NOTIFY_LEVELS = ("changes", "problems", "always", "never")
+
+
+def should_notify(level: str, changed: bool, problems: bool, action_needed: bool) -> bool:
+    """changes: any position change, problem or action; problems: only problems and
+    actions (errors, stale data, orders a signal slot wants placed by hand)."""
+    if level == "always":
+        return True
+    if level == "never":
+        return False
+    return problems or action_needed or (level == "changes" and changed)
 
 
 def _fmt_ts(ts) -> str:
@@ -164,7 +178,9 @@ def main() -> int:
     ap.add_argument("--db", default="state/ledger.db")
     ap.add_argument("--cache-dir", default="data")
     ap.add_argument("--env-file", default=".env")
-    ap.add_argument("--notify", choices=["changes", "always", "never"], default="changes")
+    ap.add_argument("--notify", choices=NOTIFY_LEVELS, default=None,
+                    help="when to send Telegram: changes (default, or NOTIFY_PAPER), problems "
+                         "(errors, warnings, orders to place by hand), always, never")
     ap.add_argument("--offline", action="store_true", help="use cached prices only")
     ap.add_argument("--dry-run", action="store_true",
                     help="compute and print, but write nothing and send nothing")
@@ -173,6 +189,10 @@ def main() -> int:
     a = ap.parse_args()
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     load_env(a.env_file)
+    a.notify = (a.notify or os.environ.get("NOTIFY_PAPER") or "changes").strip().lower()
+    if a.notify not in NOTIFY_LEVELS:
+        print(f"NOTIFY_PAPER={a.notify!r} is not one of {NOTIFY_LEVELS}; using changes")
+        a.notify = "changes"
 
     insts = universe(a.universe)
     if a.strategy == "carry":
@@ -261,9 +281,7 @@ def main() -> int:
         print("\n".join(exec_lines))
         message += "\n" + "\n".join(exec_lines)
 
-    should_send = (a.notify == "always" or exec_notify or
-                   (a.notify == "changes" and (any_change or warnings_ or errors)))
-    if should_send and a.notify != "never":
+    if should_notify(a.notify, any_change, bool(warnings_ or errors), exec_notify):
         send(message)
     return 1 if errors else 0
 

@@ -1,6 +1,6 @@
 # Trading bot plan
 
-Last updated 2026-09-15 (UTC).
+Last updated 2026-09-15, 22:50 UTC.
 
 ## What you asked for
 
@@ -65,51 +65,102 @@ Last updated 2026-09-15 (UTC).
   - Every model's out-of-sample verdict is currently "NO EDGE".
   - Predictions stay paper only either way.
 
+### Cutover: the bot now runs in the cloud (2026-09-15, 20:45 UTC)
+- **PC tasks disabled:** "SignalBot Paper Jobs", "SignalBot MT5 Executor (demo)" and "SignalBot Daily Compare" are off; nothing on the PC trades any more.
+  - The PC's MT5 terminal can stay open.
+  - To undo, re-enable the tasks (after unscheduling the cloud, see `deploy/CLOUD_RUN.md`).
+- **Production state:** the PC's `data/` and `state/` were uploaded as `gs://pioneering-axe-233302-signal-bot/prod/state.tar.gz` (SQLite backup copy; the PC files were not changed).
+  - Both jobs use `prod`.
+  - A later `setup.sh job` keeps `prod` and the executor switch (fixed so a redeploy can't fall back to staging or stop trading).
+- **Demo execution in the cloud:** `EXECUTOR_ENABLED=true`, `EXECUTOR_MODE=demo`, live gate closed.
+  - A dry run first matched the PC's last sync: bot positions at target, your 2 manual EURUSD trades ignored.
+  - **Bug found and fixed:** the first real sync (21:02) had its orders rejected (nothing filled). The Wine bridge passed an empty keyword dict, which MetaTrader5's `order_send` refuses. Confirmed with `order_check` on the PC, fixed in `live/mt5_bridge.py`.
+  - **Rerun at 21:15:** AUD_USD +4,000 and NZD_USD +4,000 units filled.
+- **Scheduled with Cloud Scheduler:**
+  - `signal-bot-trigger`: every hour at :02 UTC. The first scheduled run was at 21:02.
+  - `signal-bot-retrain-trigger`: Sundays at 00:30 UTC.
+- **Models trained on prod** (14, all "NO EDGE" for now), so hourly paper predictions start.
+- **Cleanup:**
+  - Trial VM `signal-bot` **stopped** (its external IP is released). Deleting it is yours to do (below).
+  - `signal-bot-bake` redeployed without its temporary fix (rebuilt `wine-base`).
+  - Test job `signal-bot-diag` deleted.
+- **Prod runs so far:**
+
+  | Run (UTC) | What | Result | Time | Peak memory |
+  |---|---|---|---|---|
+  | 20:48 | dry run | 7/7 jobs ok, nothing to trade | 118 s | 1,882 MB |
+  | 21:02 (scheduled) | first cloud sync | 7/7 ok, 2 orders rejected (bridge bug) | 144 s | 2,012 MB |
+  | 21:15 | sync after the fix | 7/7 ok, 2 orders filled | 112 s | 1,844 MB |
+
+  Memory is counted with reclaimable file cache (about 1.2 GB of it), so the real margin is larger than these peaks suggest. See "Next improvements".
+
+### Telegram reports, and getting off paid secrets (2026-09-15, 22:45 UTC)
+- **Your bot:** @FxCurrencyBot. The token you added works.
+- **What the bot sends** (paper position changes stay off; `NOTIFY_PAPER=changes` turns them on):
+  - the daily strategy comparison, after the 23:02 UTC run;
+  - demo orders filled, rejected or blocked by a safety check;
+  - errors and stale data in a paper job;
+  - a short alert when a run has problems: MT5 did not start, a job failed, the state was not saved, or the run was skipped. A run killed outright (out of memory) cannot send one; that shows in the logs.
+- **Secret Manager costs money here** ($0.06 per active version per month beyond 6 free, and the billing account has 20). So the bot no longer uses it:
+  - Settings now live in one private file, `gs://pioneering-axe-233302-signal-bot/secrets/bot.env`, read at the start of every run (`SECRETS_URI`).
+  - The values were copied there **inside Cloud Run**, from the secrets themselves, so neither the password nor the token passed through this chat.
+  - Both jobs no longer reference Secret Manager, so its two bot secrets can be destroyed (below). `setup.sh` no longer attaches them either: `bash deploy/cloudrun/setup.sh settings` writes one value (password, token, chat id) into the file, asking for it without showing it.
+  - **Working end to end:** a probe logged into MT5 with the file alone, and the 23:02 run sent the comparison and an order notice to Telegram.
+  - **Security note:** this is no weaker *in this project*. The default compute service account (which `apk-clone-factory`, `appcloner-server` and `scraper-camoufox` run as) already holds project-wide `editor`, `secretmanager.secretAccessor` and `storage.objectAdmin`, so it could already read every secret and every bucket. Worth revisiting before any live-money password.
+- **Still to do here:** press Start in @FxCurrencyBot so Telegram reveals a chat to send to; then the chat id is set on both jobs and a test message goes out.
+
 ## What I'm working on now
 
-The Cloud Run port is working on staging. Finishing touches, done 2026-09-15:
+Nothing is running by hand. The bot runs by itself every hour. What's left needs you, or can wait.
 
-- [x] Retraining job tested.
-- [x] `deploy/CLOUD_RUN.md` updated:
-  - Measured budget, memory lines and `MEMORY_REPORT_AT`.
-  - WebView2 off, `MT5_MAX_BARS`, the login requirement, a history-download row.
-- [x] Throwaway test job `signal-bot-diag` deleted.
-- [ ] `signal-bot-bake` still carries a temporary fix in its arguments. The next full `bash deploy/cloudrun/setup.sh images` (only needed to update MT5) rebuilds it cleanly.
-- [ ] Waiting for your OK on the next step: scheduling (below).
+## Left for you
 
-## Still to do to finish the move (needs your OK where marked)
+0. **Build 20 years of Exness history on the PC (in progress, 2026-09-16).** Cloud Run can't download it: one 10-year attempt hit the 30-minute limit, because a fresh container downloads everything again and keeps it in memory. A desktop terminal does it in minutes, and the cloud then fetches only the last days.
+   - **You:** install Exness's MT5 on the PC and log in with the **investor (read-only) password**, so this PC can't trade.
+   - **You:** Tools > Options > Charts > Max. bars in chart → Unlimited, then restart MT5.
+   - **Me:** `python -m live.mt5_data --years 20`, which only downloads prices: no ledger, no orders. It reports each symbol's first bar and whether the history is complete.
+   - **Me:** `python -m live.cloud_state add --uri gs://pioneering-axe-233302-signal-bot/prod data/mt5_Exness-MT5Real10_*`. This takes the same lease as a run, so it never clashes with the schedule.
+   - **Me:** set `MT5_HISTORY_YEARS=20` on the job, run it once, and check that the run stays around 2–3 minutes and within 2 GiB.
 
-1. **Schedule the jobs** (your OK): `bash deploy/cloudrun/setup.sh schedule`.
-   - Enables the Cloud Scheduler API.
-   - Runs hourly at :02 and retraining on Sundays (2 of the 3 free scheduler jobs).
-2. **Cutover from the PC** (your OK, and you run the PC steps):
-   - Disable the PC's scheduled tasks.
-   - Upload the PC state as `prod`.
-   - Point the job at `prod`.
-   - The PC and the cloud must never run the same ledger or trade the same account at the same time.
-3. **Telegram alerts:** runs log "TELEGRAM_TOKEN / TELEGRAM_CHAT_ID not set". Add them as secrets if you want messages from the cloud. Each new secret version costs about $0.06/month, because the project is already past Secret Manager's 6 free versions.
-4. **Delete the trial VM** `signal-bot` (your OK). It is no longer needed, and removing it also removes its external IP.
-5. **Change the MT5 demo password.** It was pasted in chat, so change it, then add a new secret version yourself.
+1. **Press Start in @FxCurrencyBot** (Telegram). A bot cannot write to you until you write to it. Tell me when done and I finish the wiring: chat id on both jobs, then a test message.
+2. **Change the MT5 demo password.** It was pasted in chat.
+   - Change it in MT5 (or on the MetaQuotes account page).
+   - Then save the new one yourself; it asks for the value and hides it as you type:
+     ```bash
+     bash deploy/cloudrun/setup.sh settings     # key: MT5_PASSWORD
+     ```
+   - The next hourly run uses it. Never paste it in chat.
+3. **Delete the trial VM** (it is stopped). This deletes its disk for good:
+   `gcloud compute instances delete signal-bot --zone=us-central1-a --project=pioneering-axe-233302`
+4. **Get Secret Manager back to zero cost.** 20 active versions, 6 free, so about $0.84/month at list price. Destroying a version is permanent, so these are yours to run. Every app reads `:latest`, so no app loses the version it uses.
+   - **The bot's two, now unused** (nothing references them any more):
+     `gcloud secrets delete signal-bot-mt5-password --project=pioneering-axe-233302`
+     `gcloud secrets delete signal-bot-telegram-token --project=pioneering-axe-233302`
+   - **Older versions no app reads** (each app reads `:latest`): `API_KEY` v1, `KEYSTORE_PASSWORD` v1, `DB_PASSWORD` v1 (already disabled, still billed).
+   - **Secrets nothing in Cloud Run references at all:** `APK_KEYSTORE` (v1, v2), `DB_CONNECTION`, `DB_DATABASE`, `DB_HOST`, `DB_PORT`, `DB_USERNAME`. Check first whether something outside Cloud Run uses them (a build, a local script). `APK_KEYSTORE` looks like an older copy of `apk-keystore`; **download any keystore before destroying it** — losing an Android signing key means you can no longer update that app.
+   - That leaves 8: `APP_KEY`, `CLOUD_TASKS_SECRET`, `DB_PASSWORD`, `MAIL_PASSWORD` (the fiverr-keywords services), `API_KEY`, `KEYSTORE_PASSWORD` (appcloner-server), `apk-keystore`, `keystore-password` (apk-clone-factory).
+   - **To reach 6 (free), one of those apps has to go.** You said some are unused: retiring `appcloner-server` or `apk-clone-factory` frees exactly 2. Tell me which, and I can list what else it uses before you delete anything.
+5. **Optional: delete the staging test state** (~30 MB, a copy of the PC data plus test runs):
+   `gcloud storage rm -r gs://pioneering-axe-233302-signal-bot/staging/`
+
+## Next improvements (no rush)
+
+- **Memory headroom:** the terminal still downloads full history for EURUSD, GBPUSD, USDJPY and USDCHF (~100 MB each, in memory). It looks like it opens its default charts even with the chart files removed. Stopping that frees ~400 MB and ~10–20 s per run.
+- **Run length:** MT5 start (45–60 s) and one Python start per paper job (~70 s for 7 jobs) are the biggest costs.
 
 ## The long run
 
-1. **Paper phase in the cloud.**
-   - Let the strategies build a live track record.
-   - Read the daily comparison.
-   - Retrain the models weekly and score their paper predictions.
-2. **Demo execution.**
-   - Turn on `EXECUTOR_ENABLED=true` for the demo slot, with the master password added by you.
-   - Check fills, sizing and the safety limits against the paper ledger.
-   - The bot must leave your manual trades alone.
-3. **Exness.**
-   - Exness demo first (recommended), same checks.
+1. **Paper and demo phase in the cloud.**
+   - Let the strategies build a live track record; read the daily comparison (in the 23:02 UTC run's log).
+   - Retrain weekly and score the paper predictions.
+   - Check demo fills, sizing and the safety limits against the paper ledger. The bot leaves your manual trades alone.
+2. **Exness.**
+   - Exness demo first (recommended), same checks, as a repeat of the cutover steps in `deploy/CLOUD_RUN.md`.
    - Then Exness live with `ALLOW_LIVE_TRADING`, small size, only when you decide.
    - Re-check the broker's server clock (Exness uses UTC).
    - Keep one price source per ledger.
-4. **Keep it inside the free tier.**
-   - Watch the phase timings and memory lines in each run's log.
-   - If runs grow, first cut MT5 start-up (45–60 s) and the per-job Python start-up (paper jobs take ~70 s).
-5. **Watch Nigeria's SEC rules for online FX/CFD brokers.** They may change which offshore brokers can serve you.
+3. **Keep it inside the free tier.** Watch the phase timings and memory lines in each run's log.
+4. **Watch Nigeria's SEC rules for online FX/CFD brokers.** They may change which offshore brokers can serve you.
 
 ## Free-tier budget (per billing account, shared with your existing services)
 
@@ -118,7 +169,8 @@ The Cloud Run port is working on staging. Finishing touches, done 2026-09-15:
 | Cloud Run vCPU-seconds | 240,000 | ~41,000 | 730 x 140 s x 1 vCPU ≈ 102,000 |
 | Cloud Run GiB-seconds | 450,000 | ~112,000 | 730 x 140 s x 2 GiB ≈ 204,000 |
 | Cloud Storage (us-central1) | 5 GB | 3.2 GB | ~30 MB state + 7 daily backups |
-| Cloud Scheduler jobs | 3 | 0 | 2 |
+| Cloud Scheduler jobs | 3 | 0 | 2 (scheduled) |
+| Secret Manager active versions | 6 | 20 (your other apps) | 0 (settings live in the bucket) |
 
 - **Total with the bot:** ~143,000 vCPU-s (60%) and ~316,000 GiB-s (70%) a month. That leaves headroom, but runs should not grow much past ~150 s.
 - **Today's testing:** the one-off bake, diagnostic and test runs plus image builds are small against the monthly allowance.

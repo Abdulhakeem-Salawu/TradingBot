@@ -72,13 +72,14 @@ def _release_lock(handle) -> None:
     handle.close()
 
 
-NOTIFY_MODES = ("changes", "always", "never")
+NOTIFY_MODES = ("changes", "problems", "always", "never")   # as live.signal_job
 
 
 def notify_mode() -> str:
     """NOTIFY_PAPER for the paper jobs: always = a report every run, changes =
-    only when a position moves or something is wrong. An unknown value falls
-    back rather than failing every job on a typo."""
+    only when a position moves or something is wrong, problems = only errors,
+    stale data and orders to place by hand. An unknown value falls back
+    rather than failing every job on a typo."""
     mode = os.environ.get("NOTIFY_PAPER", "changes").strip().lower()
     if mode not in NOTIFY_MODES:
         print(f"NOTIFY_PAPER={mode!r} is not one of {NOTIFY_MODES}; using changes")
@@ -86,7 +87,9 @@ def notify_mode() -> str:
     return mode
 
 
-def run(jobs, env_file: str, compare: bool, python: str = sys.executable) -> int:
+def run(jobs, env_file: str, compare: bool, python: str = sys.executable,
+        failed: list | None = None) -> int:
+    """Run each job in turn; names of jobs that did not finish cleanly go to `failed`."""
     Path("logs").mkdir(exist_ok=True)
     print(f"== {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC")
     failures = 0
@@ -109,6 +112,8 @@ def run(jobs, env_file: str, compare: bool, python: str = sys.executable) -> int
         secs = (datetime.now(timezone.utc) - started).total_seconds()
         print(f"{name:<22} {'ok' if rc == 0 else f'exit {rc}'}  ({secs:.0f}s, logs/{name}.log)")
         failures += rc != 0
+        if rc != 0 and failed is not None:
+            failed.append(f"{name} ({'timed out' if rc == -1 else f'exit {rc}'})")
     if compare:
         with open(Path("logs") / "compare.log", "a", encoding="utf-8") as log:
             log.write(f"\n===== {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC =====\n")
@@ -117,6 +122,8 @@ def run(jobs, env_file: str, compare: bool, python: str = sys.executable) -> int
                                 stdout=log,
                                 stderr=subprocess.STDOUT).returncode
         print(f"{'compare':<22} {'ok' if rc == 0 else f'exit {rc}'}  (logs/compare.log)")
+        if rc != 0 and failed is not None:
+            failed.append(f"daily comparison (exit {rc})")
     return 1 if failures else 0
 
 

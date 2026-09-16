@@ -7,26 +7,50 @@
 #   bash deploy/cloudrun/setup.sh images      # wine-base, MT5 bake (Cloud Run job), mt5-base, bot
 #   bash deploy/cloudrun/setup.sh bot-image   # rebuild only the bot image after code changes
 #   bash deploy/cloudrun/setup.sh job         # create/update the jobs: signal-bot (hourly), signal-bot-retrain
-#   bash deploy/cloudrun/setup.sh secret      # create the MT5 password secret (you add the value)
+#   bash deploy/cloudrun/setup.sh settings    # set one value (MT5 password, Telegram token/chat) in the bucket
 #   bash deploy/cloudrun/setup.sh schedule    # Cloud Scheduler: hourly run + weekly retraining
 #   bash deploy/cloudrun/setup.sh unschedule  # pause: delete both triggers, keep everything else
 #
 # PREFIX picks the state folder in the bucket: staging while testing, prod for real.
+# `job` keeps the folder and the executor switch the jobs already have unless
+# PREFIX=... or EXECUTOR_ENABLED=... is given; new jobs start on staging, not trading.
 set -euo pipefail
 export MSYS2_ARG_CONV_EXCL="--args="   # Git Bash: keep --args=/opt/... a Linux path
 
 PROJECT="${PROJECT:-$(gcloud config get-value project 2>/dev/null)}"
 REGION="${REGION:-us-central1}"
 BUCKET="${BUCKET:-$PROJECT-signal-bot}"
-PREFIX="${PREFIX:-staging}"
+PREFIX="${PREFIX:-}"
 JOB="${JOB:-signal-bot}"
 SA="signal-bot-runner@$PROJECT.iam.gserviceaccount.com"
 REPO="$REGION-docker.pkg.dev/$PROJECT/signal-bot"
-SECRET="signal-bot-mt5-password"
+SETTINGS="bot.env"       # MT5 password and Telegram settings, in gs://BUCKET/secrets/
 HERE="$(cd "$(dirname "$0")" && pwd)"
 g() { gcloud --project="$PROJECT" "$@"; }
+job_env() {   # a variable's current value on the hourly job; empty if the job or the variable is missing
+  local env="spec.template.spec.template.spec.containers[0].env"
+  (g run jobs describe "$JOB" --region="$REGION" --flatten="$env" \
+     --format="csv[no-heading]($env.name,$env.value)" 2>/dev/null || true) | sed -n "s/^$1,//p"
+}
 
 case "${1:-}" in
+settings)
+  # The MT5 password, the Telegram token and chat id live in one private file in
+  # the bot's own bucket, read at the start of every run. Secret Manager charges
+  # for every active version beyond six and this billing account is past that.
+  # You type the value; it is never stored in this repo or passed on a command line.
+  file="$(mktemp)"; new="$(mktemp)"
+  trap 'rm -f "$file" "$new"' EXIT
+  g storage cp "gs://$BUCKET/secrets/$SETTINGS" "$file" 2>/dev/null || true
+  echo "keys in gs://$BUCKET/secrets/$SETTINGS: $(sed -n 's/^\([A-Z_][A-Z_0-9]*\)=.*/\1/p' "$file" | tr '\n' ' ')"
+  read -rp "key to set (MT5_PASSWORD, MT5_LOGIN, MT5_SERVER, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID): " key
+  read -rsp "value for $key (hidden): " value
+  echo
+  [ -n "$key" ] && [ -n "$value" ] || { echo "nothing entered"; exit 1; }
+  { grep -v "^$key=" "$file" 2>/dev/null || true; printf '%s=%s\n' "$key" "$value"; } > "$new"
+  g storage cp "$new" "gs://$BUCKET/secrets/$SETTINGS"
+  echo "$key saved; the next run uses it."
+  ;;
 resources)
   g artifacts repositories describe signal-bot --location="$REGION" >/dev/null 2>&1 ||
     g artifacts repositories create signal-bot --repository-format=docker --location="$REGION" \
@@ -71,30 +95,29 @@ bot-image)
   g builds submit --region="$REGION" --config="$HERE/cloudbuild.yaml" .
   ;;
 job)
+  # A redeploy must not move a production job back to staging or stop its trading.
+  STATE_URI="${PREFIX:+gs://$BUCKET/$PREFIX}"
+  STATE_URI="${STATE_URI:-$(job_env STATE_URI)}"
+  STATE_URI="${STATE_URI:-gs://$BUCKET/staging}"
+  EXECUTOR_ENABLED="${EXECUTOR_ENABLED:-$(job_env EXECUTOR_ENABLED)}"
+  EXECUTOR_ENABLED="${EXECUTOR_ENABLED:-false}"
+  # Deep history is built on a desktop terminal (python -m live.mt5_data --years N)
+  # and uploaded; a Cloud Run terminal downloading years of it runs out of time.
+  MT5_HISTORY_YEARS="${MT5_HISTORY_YEARS:-$(job_env MT5_HISTORY_YEARS)}"
+  MT5_HISTORY_YEARS="${MT5_HISTORY_YEARS:-2}"
+  NOTIFY_PAPER="${NOTIFY_PAPER:-$(job_env NOTIFY_PAPER)}"
+  NOTIFY_PAPER="${NOTIFY_PAPER:-problems}"   # paper jobs message only on errors and hand orders
+  echo "state: $STATE_URI, executor enabled: $EXECUTOR_ENABLED, paper messages: $NOTIFY_PAPER, history: $MT5_HISTORY_YEARS years"
   # --update-env-vars keeps MT5_LOGIN / MT5_SERVER that you set yourself.
   g run jobs deploy "$JOB" --region="$REGION" --image="$REPO/bot:latest" \
     --execution-environment=gen2 --cpu=1 --memory=2Gi --task-timeout=30m --max-retries=0 \
     --tasks=1 --parallelism=1 --service-account="$SA" --args=hourly \
-    --update-env-vars="STATE_URI=gs://$BUCKET/$PREFIX,FX_DATA_SOURCE=mt5,MT5_HISTORY_YEARS=10,MT5_SERVER_TZ=auto,EXECUTOR_MODE=demo,EXECUTOR_ENABLED=false,ALLOW_LIVE_TRADING=false,COMPARE_HOUR_UTC=23"
-  if g secrets versions list "$SECRET" --filter="state=ENABLED" --format="value(name)" 2>/dev/null | grep -q .; then
-    g run jobs update "$JOB" --region="$REGION" --update-secrets="MT5_PASSWORD=$SECRET:latest"
-  else
-    echo "note: no MT5 password yet -- the terminal starts logged out (see: setup.sh secret)"
-  fi
+    --update-env-vars="STATE_URI=$STATE_URI,SECRETS_URI=gs://$BUCKET/secrets,FX_DATA_SOURCE=mt5,MT5_HISTORY_YEARS=$MT5_HISTORY_YEARS,MT5_SERVER_TZ=auto,EXECUTOR_MODE=demo,EXECUTOR_ENABLED=$EXECUTOR_ENABLED,ALLOW_LIVE_TRADING=false,COMPARE_HOUR_UTC=23,NOTIFY_PAPER=$NOTIFY_PAPER"
   # Retraining needs no MT5: it trains on the price caches the hourly runs keep.
   g run jobs deploy "$JOB-retrain" --region="$REGION" --image="$REPO/bot:latest" \
     --execution-environment=gen2 --cpu=1 --memory=2Gi --task-timeout=45m --max-retries=0 \
     --tasks=1 --parallelism=1 --service-account="$SA" --args=retrain \
-    --update-env-vars="^|^STATE_URI=gs://$BUCKET/$PREFIX|FX_DATA_SOURCE=mt5|ML_TARGETS=fx:1h metals:1h crypto:1h|ML_HORIZON=6"
-  ;;
-secret)
-  g secrets describe "$SECRET" >/dev/null 2>&1 ||
-    g secrets create "$SECRET" --replication-policy=user-managed --locations="$REGION"
-  g secrets add-iam-policy-binding "$SECRET" --member="serviceAccount:$SA" \
-    --role=roles/secretmanager.secretAccessor >/dev/null
-  echo "Secret $SECRET is ready for its value. Add it yourself, e.g. in the console:"
-  echo "  Security > Secret Manager > $SECRET > New version"
-  echo "then run: bash deploy/cloudrun/setup.sh job"
+    --update-env-vars="^|^STATE_URI=$STATE_URI|SECRETS_URI=gs://$BUCKET/secrets|FX_DATA_SOURCE=mt5|ML_TARGETS=fx:1h metals:1h crypto:1h|ML_HORIZON=6"
   ;;
 schedule)
   g services enable cloudscheduler.googleapis.com

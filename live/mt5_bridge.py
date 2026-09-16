@@ -69,6 +69,13 @@ def from_plain(obj):
 
 
 # ---------------------------------------------------------------------- server
+def invoke(fn, args, kwargs):
+    """Call a MetaTrader5 function the way a script would. Its C functions treat
+    any keyword dict, even an empty one, as named-argument mode, so
+    order_send(request, **{}) fails with (-2, 'Unnamed arguments not allowed')."""
+    return fn(*args, **kwargs) if kwargs else fn(*args)
+
+
 def serve(port: int = DEFAULT_PORT) -> None:
     import MetaTrader5 as mt5
     import rpyc
@@ -79,10 +86,7 @@ def serve(port: int = DEFAULT_PORT) -> None:
             if name.startswith("_") or not callable(getattr(mt5, name, None)):
                 raise AttributeError(f"MetaTrader5 has no function {name!r}")
             args, kwargs = pickle.loads(payload)
-            fn = getattr(mt5, name)
-            # order_send rejects a call carrying a keyword dict at all, even an
-            # empty one, so only pass keywords when there are some.
-            return pickle.dumps(to_plain(fn(*args, **kwargs) if kwargs else fn(*args)))
+            return pickle.dumps(to_plain(invoke(getattr(mt5, name), args, kwargs)))
 
         def exposed_const(self, name: str) -> bytes:
             value = getattr(mt5, name)                # AttributeError travels back as-is
