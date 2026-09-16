@@ -5,6 +5,9 @@
     python -m live.cloud_run probe    # start MT5 and report what the bot can see; saves nothing
     python -m live.cloud_run telegram # check the Telegram bot, find the chat id, send a test message
     python -m live.cloud_run save-secrets   # copy this run's MT5/Telegram settings into SECRETS_URI
+    python -m live.cloud_run reset-feed     # once, after changing MT5 server: archive, then drop
+                                            # other servers' prices and models and the FX/gold
+                                            # paper records, so nothing from the old feed remains
 
 hourly:
   1. take the state lease and restore data/, state/, models/ from STATE_URI
@@ -574,7 +577,7 @@ def hourly_work(root: Path, now: datetime, clock: Clock) -> int:
         _print_logs(logs)
         clock.lap("paper jobs" + (" + comparison" if compare else ""))
 
-        if any((root / "models").glob("*.pkl")):
+        if any((root / "models").rglob("*.pkl")):
             code = subprocess.run([sys.executable, "-m", "live.ml_job", "predict"]).returncode
             if code:
                 problem(f"model predictions (exit {code})", echo=False)
@@ -600,6 +603,68 @@ def retrain_work(root: Path, now: datetime, clock: Clock) -> int:
         problem(f"model training (exit {rc})", echo=False)
     clock.lap("train models")
     return rc
+
+
+def reset_feed_work(root: Path, now: datetime, clock: Clock) -> int:
+    """Keep only MT5_SERVER's prices and models, restart the FX and gold paper records.
+
+    Run once after the bot moves to another MT5 server (a demo and a real server
+    are different feeds). The state before is archived first under
+    STATE_URI/archive/, which no lifecycle rule deletes.
+    """
+    from harness.instruments import universe
+    from live import cloud_state
+    from live.ledger import Ledger
+    from live.mt5_data import feed_name
+
+    server = os.environ.get("MT5_SERVER", "")
+    if not server:
+        problem("reset-feed needs MT5_SERVER (the feed to keep)")
+        return 2
+    keep = feed_name(server)
+    archive = f"archive/state-before-reset-{now:%Y%m%dT%H%M%S}.tar.gz"
+    blob = cloud_state.pack(root)
+    cloud_state.open_store(os.environ["STATE_URI"]).write(archive, blob, 0)
+    print(f"archived the state as {archive} ({len(blob) / 1e6:.1f} MB)")
+
+    removed = []
+    for cache in sorted((root / "data").glob("mt5_*")):
+        if not cache.name.startswith(f"mt5_{keep}_"):
+            cache.unlink()
+            removed.append(cache.name)
+    print(f"prices from other servers removed: {len(removed)} files")
+    for name in removed:
+        print(f"  {name}")
+
+    models = root / "models"
+    dropped = []
+    if models.is_dir():
+        feeds_kept = {keep, "binance", "dukascopy"}
+        for item in sorted(models.iterdir()):
+            if item.is_file() or item.name not in feeds_kept:
+                dropped.append(item.name + ("/" if item.is_dir() else ""))
+                shutil.rmtree(item) if item.is_dir() else item.unlink()
+    print(f"models not trained on {keep} or binance removed: {', '.join(dropped) or 'none'}")
+
+    symbols = sorted({i.symbol for u in ("fx", "metals") for i in universe(u)})
+    ledger = Ledger(str(root / "state" / "ledger.db"))
+    marks = ",".join("?" * len(symbols))
+    counts = {}
+    for table in ("positions", "trades", "equity"):
+        counts[table] = ledger.conn.execute(
+            f"DELETE FROM {table} WHERE symbol IN ({marks})", symbols).rowcount
+    ledger.commit()
+    legacy = ledger.conn.execute("SELECT COUNT(*) FROM predictions WHERE feed='legacy'").fetchone()[0]
+    ledger.conn.close()
+    print(f"FX and gold paper records restarted ({', '.join(f'{n} {t}' for t, n in counts.items())} "
+          f"rows removed); the next hourly run starts them on {keep}")
+    print(f"earlier predictions kept as 'legacy': {legacy}")
+    clock.lap("reset feed")
+    return 0
+
+
+def reset_feed() -> int:
+    return with_state("reset-feed", reset_feed_work)
 
 
 def hourly() -> int:
@@ -726,7 +791,7 @@ def main(argv=None) -> int:
     task = (argv if argv is not None else sys.argv[1:] or ["hourly"])[0]
     load_secrets()
     tasks = {"hourly": hourly, "retrain": retrain, "probe": probe, "telegram": telegram,
-             "save-secrets": save_secrets}
+             "save-secrets": save_secrets, "reset-feed": reset_feed}
     if task not in tasks:
         print(f"unknown task {task!r}: choose from {', '.join(tasks)}")
         return 2

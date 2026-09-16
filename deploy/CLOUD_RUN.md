@@ -219,6 +219,30 @@ To go back to the PC: `bash deploy/cloudrun/setup.sh unschedule`, download
 `.venv-windows/Scripts/python.exe -m live.cloud_state unpack --archive state.tar.gz --root .`,
 and re-enable the three tasks.
 
+## One price feed per account
+
+Each MT5 server is its own **feed**; a demo and a real server are different
+feeds even at the same broker. Its prices are `data/mt5_<server>_*`, its models
+`models/<server>/`, and its predictions carry its name (crypto uses `binance`).
+Everything reads the feed of `MT5_SERVER` and nothing else, so demo prices can
+never train or score a live model.
+
+- **After moving the bot to another server** (e.g. MetaQuotes demo to Exness real),
+  run once, then retrain:
+  ```bash
+  gcloud run jobs execute signal-bot --region=us-central1 --args=reset-feed --wait
+  gcloud run jobs execute signal-bot-retrain --region=us-central1 --wait
+  ```
+  `reset-feed` archives the whole state as `PREFIX/archive/state-before-reset-*.tar.gz`
+  (kept; no lifecycle rule), deletes other servers' prices and models, and
+  restarts the FX and gold paper records, which the next hourly run begins
+  afresh. Crypto records and older predictions (tagged `legacy`) stay.
+- **A demo account next to the live one** gets its own job and state folder, so
+  its paper ledger never touches live:
+  `JOB=signal-bot-demo PREFIX=demo bash deploy/cloudrun/setup.sh job` (its own
+  `MT5_LOGIN` / `MT5_SERVER` on that job). Two hourly jobs do not fit the free
+  tier together (~2 x 102,000 vCPU-s a month), so run demo and live in turns.
+
 ## Operating
 
 | Want to | Do |

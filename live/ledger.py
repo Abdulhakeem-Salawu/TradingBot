@@ -71,10 +71,24 @@ CREATE TABLE IF NOT EXISTS syncs (
     equity REAL, currency TEXT, summary TEXT, executor_mode TEXT
 );
 CREATE TABLE IF NOT EXISTS predictions (
-    symbol TEXT, timeframe TEXT, horizon INTEGER, bar_ts TEXT, prob REAL NOT NULL,
+    feed TEXT NOT NULL, symbol TEXT, timeframe TEXT, horizon INTEGER, bar_ts TEXT, prob REAL NOT NULL,
     model_until TEXT, model_verdict TEXT, outcome REAL, fwd_return REAL, created_at TEXT,
-    PRIMARY KEY (symbol, timeframe, horizon, bar_ts)
+    PRIMARY KEY (feed, symbol, timeframe, horizon, bar_ts)
 );
+"""
+# Predictions made before they carried their price feed: kept, tagged, never scored again.
+LEGACY_FEED = "legacy"
+PREDICTIONS_WITH_FEED = f"""CREATE TABLE predictions_new (
+    feed TEXT NOT NULL, symbol TEXT, timeframe TEXT, horizon INTEGER, bar_ts TEXT, prob REAL NOT NULL,
+    model_until TEXT, model_verdict TEXT, outcome REAL, fwd_return REAL, created_at TEXT,
+    PRIMARY KEY (feed, symbol, timeframe, horizon, bar_ts)
+);
+INSERT INTO predictions_new (feed, symbol, timeframe, horizon, bar_ts, prob, model_until,
+    model_verdict, outcome, fwd_return, created_at)
+    SELECT '{LEGACY_FEED}', symbol, timeframe, horizon, bar_ts, prob, model_until,
+    model_verdict, outcome, fwd_return, created_at FROM predictions;
+DROP TABLE predictions;
+ALTER TABLE predictions_new RENAME TO predictions;
 """
 MIGRATIONS = (
     "ALTER TABLE syncs ADD COLUMN executor_mode TEXT",
@@ -105,6 +119,9 @@ class Ledger:
                 self.conn.execute(sql)
             except sqlite3.OperationalError:
                 pass
+        columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(predictions)")}
+        if "feed" not in columns:   # the feed joins the primary key: rebuild the table once
+            self.conn.executescript("BEGIN;" + PREDICTIONS_WITH_FEED + "COMMIT;")
 
     # ----------------------------------------------------------- paper sleeves
     def position(self, strategy: str, timeframe: str, symbol: str) -> sqlite3.Row | None:
@@ -276,29 +293,30 @@ class Ledger:
                           (mode, now_iso(), nav, currency))
 
     # ------------------------------------------------------------- predictions
-    def add_prediction(self, symbol, timeframe, horizon, bar_ts, prob, model_until,
+    def add_prediction(self, feed, symbol, timeframe, horizon, bar_ts, prob, model_until,
                        model_verdict) -> bool:
-        """Record a model's probability for a bar once; False if already recorded."""
+        """Record a model's probability for a bar of one price feed once; False if already recorded."""
         cur = self.conn.execute(
-            "INSERT OR IGNORE INTO predictions (symbol, timeframe, horizon, bar_ts, prob, "
-            "model_until, model_verdict, created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (symbol, timeframe, horizon, bar_ts, prob, model_until, model_verdict, now_iso()))
+            "INSERT OR IGNORE INTO predictions (feed, symbol, timeframe, horizon, bar_ts, prob, "
+            "model_until, model_verdict, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (feed, symbol, timeframe, horizon, bar_ts, prob, model_until, model_verdict, now_iso()))
         return cur.rowcount == 1
 
-    def open_predictions(self, symbol: str, timeframe: str) -> list[sqlite3.Row]:
+    def open_predictions(self, feed: str, symbol: str, timeframe: str) -> list[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT * FROM predictions WHERE symbol=? AND timeframe=? AND outcome IS NULL "
-            "ORDER BY bar_ts", (symbol, timeframe)).fetchall()
+            "SELECT * FROM predictions WHERE feed=? AND symbol=? AND timeframe=? AND outcome IS NULL "
+            "ORDER BY bar_ts", (feed, symbol, timeframe)).fetchall()
 
-    def resolve_prediction(self, symbol, timeframe, horizon, bar_ts, outcome, fwd_return) -> None:
+    def resolve_prediction(self, feed, symbol, timeframe, horizon, bar_ts, outcome, fwd_return) -> None:
         self.conn.execute(
-            "UPDATE predictions SET outcome=?, fwd_return=? WHERE symbol=? AND timeframe=? "
-            "AND horizon=? AND bar_ts=?", (outcome, fwd_return, symbol, timeframe, horizon, bar_ts))
+            "UPDATE predictions SET outcome=?, fwd_return=? WHERE feed=? AND symbol=? AND timeframe=? "
+            "AND horizon=? AND bar_ts=?", (outcome, fwd_return, feed, symbol, timeframe, horizon, bar_ts))
 
-    def resolved_predictions(self, symbol: str, timeframe: str, limit: int = 500) -> list[sqlite3.Row]:
+    def resolved_predictions(self, feed: str, symbol: str, timeframe: str,
+                             limit: int = 500) -> list[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT * FROM predictions WHERE symbol=? AND timeframe=? AND outcome IS NOT NULL "
-            "ORDER BY bar_ts DESC LIMIT ?", (symbol, timeframe, limit)).fetchall()
+            "SELECT * FROM predictions WHERE feed=? AND symbol=? AND timeframe=? AND outcome IS NOT NULL "
+            "ORDER BY bar_ts DESC LIMIT ?", (feed, symbol, timeframe, limit)).fetchall()
 
     def commit(self) -> None:
         self.conn.commit()

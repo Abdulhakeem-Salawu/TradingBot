@@ -15,8 +15,15 @@ live data, and no order is ever placed from them.
 Settings (environment or .env):
   ML_TARGETS   universe:timeframe list (default "fx:1h metals:1h crypto:1h")
   ML_HORIZON   bars per prediction (default 6)
+  MT5_SERVER   the broker server whose prices FX and gold models use
 
-Models are pickles in models/. Only ever load models this bot trained itself.
+ONE FEED PER MODEL. A model is trained, stored and used for one price feed:
+the MT5 server for FX and gold (a demo and a real server are different feeds),
+binance for crypto. Models live in models/<feed>/, predictions carry their
+feed, and a model is never applied to another feed's prices -- so demo prices
+can never train or score a live model.
+
+Models are pickles in models/<feed>/. Only ever load models this bot trained itself.
 """
 
 from __future__ import annotations
@@ -35,7 +42,7 @@ import pandas as pd
 import sklearn
 from sklearn.ensemble import HistGradientBoostingClassifier
 
-from harness.data import load_prices
+from harness.data import load_prices, price_source
 from harness.features import FEATURE_NAMES, build_features
 from harness.instruments import TIMEFRAMES, UNIVERSES, universe
 from harness.labels import LabelSpec, make_labels
@@ -68,8 +75,22 @@ def parse_targets(text: str):
     return out
 
 
-def model_paths(model_dir: str, symbol: str, timeframe: str, horizon: int) -> tuple[Path, Path]:
-    base = Path(model_dir) / f"{symbol}_{timeframe}_h{horizon}"
+def feed_for(inst) -> str:
+    """The price feed an instrument's model is trained on and applied to."""
+    source = price_source(inst)
+    if source != "mt5":
+        return source
+    server = os.environ.get("MT5_SERVER", "")
+    if not server:
+        raise ValueError(f"{inst.symbol}: MT5 prices need MT5_SERVER to tell which feed a model is for")
+    from live.mt5_data import feed_name
+
+    return feed_name(server)
+
+
+def model_paths(model_dir: str, feed: str, symbol: str, timeframe: str,
+                horizon: int) -> tuple[Path, Path]:
+    base = Path(model_dir) / feed / f"{symbol}_{timeframe}_h{horizon}"
     return base.with_suffix(".pkl"), base.with_suffix(".json")
 
 
@@ -81,10 +102,10 @@ def training_frame(df: pd.DataFrame, costs, horizon: int) -> pd.DataFrame:
 
 # ----------------------------------------------------------------------- train
 def train_one(inst, timeframe: str, horizon: int, df: pd.DataFrame, model_dir: str,
-              n_models: int, splits: int = 5) -> str:
+              n_models: int, feed: str, splits: int = 5) -> str:
     frame = training_frame(df, inst.costs, horizon)
     if len(frame) < 1000:
-        return f"{inst.symbol:<8} {timeframe}: only {len(frame)} usable bars -- not trained"
+        return f"{inst.symbol:<8} {timeframe} [{feed}]: only {len(frame)} usable bars -- not trained"
     X = frame[FEATURE_NAMES].to_numpy(dtype=float)
     y = frame["_y"].to_numpy(dtype=float)
     fwd = frame["_fwd"].to_numpy(dtype=float)
@@ -100,19 +121,21 @@ def train_one(inst, timeframe: str, horizon: int, df: pd.DataFrame, model_dir: s
     rep = score_predictions(np.concatenate(truth), np.concatenate(probs), np.concatenate(fwds),
                             inst.costs, threshold=0.5, n_trials=n_models, horizon=horizon)
 
-    pkl, meta = model_paths(model_dir, inst.symbol, timeframe, horizon)
+    pkl, meta = model_paths(model_dir, feed, inst.symbol, timeframe, horizon)
     pkl.parent.mkdir(parents=True, exist_ok=True)
     pkl.write_bytes(pickle.dumps(new_model().fit(X, y)))
     verdict = rep.verdict.split(".")[0].strip()
     meta.write_text(json.dumps({
-        "symbol": inst.symbol, "timeframe": timeframe, "horizon": horizon,
+        "symbol": inst.symbol, "timeframe": timeframe, "horizon": horizon, "feed": feed,
+        "trained_from": str(frame.index[0]),
         "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "trained_until": str(frame.index[-1]), "rows": len(frame),
         "features": FEATURE_NAMES, "sklearn": sklearn.__version__,
         "oos": {"accuracy": rep.accuracy, "lift": rep.accuracy_lift,
                 "expectancy": rep.net_expectancy, "trades": rep.n_trades, "verdict": verdict},
     }, indent=1))
-    return (f"{inst.symbol:<8} {timeframe}: {len(frame):,} bars to {frame.index[-1]:%Y-%m-%d %H:%M}, "
+    return (f"{inst.symbol:<8} {timeframe} [{feed}]: {len(frame):,} bars "
+            f"{frame.index[0]:%Y-%m-%d} to {frame.index[-1]:%Y-%m-%d %H:%M}, "
             f"out-of-sample lift {rep.accuracy_lift:+.1%}, expectancy {rep.net_expectancy:+.3%} "
             f"-> {verdict}")
 
@@ -121,8 +144,10 @@ def train(targets, horizon: int, cache_dir: str, offline: bool, model_dir: str) 
     failures = 0
     for inst, tf in targets:
         try:
+            feed = feed_for(inst)
             df = load_prices(inst, tf, cache_dir, offline)
-            print(train_one(inst, tf, horizon, df, model_dir, n_models=len(targets)), flush=True)
+            print(train_one(inst, tf, horizon, df, model_dir, n_models=len(targets), feed=feed),
+                  flush=True)
         except Exception as e:  # noqa: BLE001 -- one instrument must not stop the others
             print(f"{inst.symbol:<8} {tf}: FAILED {type(e).__name__}: {e}", flush=True)
             failures += 1
@@ -131,11 +156,13 @@ def train(targets, horizon: int, cache_dir: str, offline: bool, model_dir: str) 
 
 # --------------------------------------------------------------------- predict
 def predict_one(ledger: Ledger, inst, timeframe: str, horizon: int, df: pd.DataFrame,
-                model_dir: str) -> str | None:
-    pkl, meta = model_paths(model_dir, inst.symbol, timeframe, horizon)
+                model_dir: str, feed: str) -> str | None:
+    pkl, meta = model_paths(model_dir, feed, inst.symbol, timeframe, horizon)
     if not (pkl.exists() and meta.exists()):
         return None
     info = json.loads(meta.read_text())
+    if info.get("feed") != feed:
+        return f"{inst.symbol:<8} {timeframe}: model was trained on {info.get('feed')!r}, not {feed} -- run train"
     if info.get("sklearn") != sklearn.__version__ or info.get("features") != FEATURE_NAMES:
         return f"{inst.symbol:<8} {timeframe}: model is from another version -- run train"
 
@@ -145,14 +172,14 @@ def predict_one(ledger: Ledger, inst, timeframe: str, horizon: int, df: pd.DataF
     bar_ts = df.index[-1]
     model = pickle.loads(pkl.read_bytes())
     prob = float(model.predict_proba(features[FEATURE_NAMES].iloc[[-1]].to_numpy(dtype=float))[0, 1])
-    new = ledger.add_prediction(inst.symbol, timeframe, horizon, str(bar_ts), prob,
+    new = ledger.add_prediction(feed, inst.symbol, timeframe, horizon, str(bar_ts), prob,
                                 info["trained_until"], info["oos"]["verdict"])
 
     labels, fwd = make_labels(df["close"], LabelSpec(horizon=horizon, costs=inst.costs))
-    for row in ledger.open_predictions(inst.symbol, timeframe):
+    for row in ledger.open_predictions(feed, inst.symbol, timeframe):
         ts = pd.Timestamp(row["bar_ts"])
         if ts in labels.index and pd.notna(labels.loc[ts]):
-            ledger.resolve_prediction(inst.symbol, timeframe, row["horizon"], row["bar_ts"],
+            ledger.resolve_prediction(feed, inst.symbol, timeframe, row["horizon"], row["bar_ts"],
                                       float(labels.loc[ts]), float(fwd.loc[ts]))
     return (f"{inst.symbol:<8} {timeframe} bar {bar_ts:%Y-%m-%d %H:%M}: p={prob:.2f} "
             f"{'LONG' if prob >= 0.5 else 'flat'}{'' if new else ' (already recorded)'}"
@@ -164,8 +191,9 @@ def predict(targets, horizon: int, cache_dir: str, model_dir: str, db: str) -> i
     failures = 0
     for inst, tf in targets:
         try:
+            feed = feed_for(inst)
             line = predict_one(ledger, inst, tf, horizon,
-                               load_prices(inst, tf, cache_dir, offline=True), model_dir)
+                               load_prices(inst, tf, cache_dir, offline=True), model_dir, feed)
             if line:
                 print(line, flush=True)
         except Exception as e:  # noqa: BLE001
@@ -177,10 +205,15 @@ def predict(targets, horizon: int, cache_dir: str, model_dir: str, db: str) -> i
 
 def report(targets, db: str) -> int:
     ledger = Ledger(db)
-    print(f"{'symbol':<8} {'tf':<3} {'resolved':>8} {'LONG calls':>10} {'hit rate':>8} "
+    print(f"{'symbol':<8} {'tf':<3} {'feed':<18} {'resolved':>8} {'LONG calls':>10} {'hit rate':>8} "
           f"{'base rate':>9} {'avg fwd when LONG':>17}")
     for inst, tf in targets:
-        rows = ledger.resolved_predictions(inst.symbol, tf, limit=5000)
+        try:
+            feed = feed_for(inst)
+        except ValueError as e:
+            print(e)
+            continue
+        rows = ledger.resolved_predictions(feed, inst.symbol, tf, limit=5000)
         if not rows:
             continue
         outcome = np.array([r["outcome"] for r in rows])
@@ -188,7 +221,7 @@ def report(targets, db: str) -> int:
         fwd = np.array([r["fwd_return"] for r in rows])
         hit = f"{outcome[calls].mean():.1%}" if calls.any() else "-"
         avg = f"{fwd[calls].mean():+.3%}" if calls.any() else "-"
-        print(f"{inst.symbol:<8} {tf:<3} {len(rows):>8} {int(calls.sum()):>10} {hit:>8} "
+        print(f"{inst.symbol:<8} {tf:<3} {feed:<18} {len(rows):>8} {int(calls.sum()):>10} {hit:>8} "
               f"{outcome.mean():>9.1%} {avg:>17}")
     print("hit rate = share of LONG calls that beat the round-trip cost; compare with base rate.")
     return 0

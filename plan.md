@@ -79,7 +79,7 @@ Last updated 2026-09-16, 12:40 UTC.
 - **Scheduled with Cloud Scheduler:**
   - `signal-bot-trigger`: every hour at :02 UTC. The first scheduled run was at 21:02.
   - `signal-bot-retrain-trigger`: Sundays at 00:30 UTC.
-- **Models trained on prod** (14, all "NO EDGE" for now), so hourly paper predictions start.
+- **Models trained on prod** (14, all "NO EDGE" for now), so hourly paper predictions start. These were trained on MetaQuotes-Demo prices; they are replaced by the Exness retrain below.
 - **Cleanup:**
   - Trial VM `signal-bot` **stopped** (its external IP is released). Deleting it is yours to do (below).
   - `signal-bot-bake` redeployed without its temporary fix (rebuilt `wine-base`).
@@ -112,6 +112,17 @@ Last updated 2026-09-16, 12:40 UTC.
 ## What I'm working on now
 
 Nothing is running by hand. The bot runs by itself every hour. What's left needs you, or can wait.
+
+### Demo and live data kept apart; models retrained on Exness only (2026-09-16)
+- **Why:** the 14 models had been trained on MetaQuotes-Demo prices and kept predicting after the move to Exness. Nothing stopped a demo feed from training or scoring a live model: models were named only by symbol, and training read the newest price file of any server.
+- **One feed per MT5 server** (a demo and a real server are different feeds):
+  - prices are `data/mt5_<server>_*`, and offline reads take only `MT5_SERVER`'s file, refusing to guess;
+  - models are `models/<server>/` (crypto: `models/binance/`), and each records its feed;
+  - a model is never applied to another feed's prices;
+  - predictions carry their feed, and the 187 earlier ones are kept as `legacy`, excluded from scoring and reports.
+- **`reset-feed`:** a one-off cloud task that archives the state (`prod/archive/`), removes other servers' prices and models, and restarts the FX and gold paper records. Crypto keeps its record.
+- **Then:** all 14 models retrained from scratch on Exness (FX, gold) and Binance (crypto).
+- **Later, a demo account:** its own job and state folder (`JOB=signal-bot-demo PREFIX=demo`), run in turns with live, since both hourly don't fit the free tier.
 
 ## Left for you
 

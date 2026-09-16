@@ -624,6 +624,23 @@ def main() -> int:
         check(abs(bars["spread"].iloc[-1] - 12 * 0.00001 / 1.15) < 1e-12, "spread converted from points")
         cached, c2 = fetch_mt5_hourly(universe("fx")[0], str(tmp / "mt5data"), offline=True)
         check(len(cached) == 4 and c2 == complete, "offline reads the MT5 cache")
+        import json
+        other = tmp / "mt5data" / "mt5_Other-Real_EUR_USD_H1.parquet"
+        bars.iloc[:2].to_parquet(other)                  # written last: the newest file
+        other.with_suffix(".json").write_text(json.dumps({"complete_until": "2026-07-08T08:00:00+00:00"}))
+        try:
+            fetch_mt5_hourly(universe("fx")[0], str(tmp / "mt5data"), offline=True)
+            check(False, "prices from two servers and no MT5_SERVER must not be guessed")
+        except BrokerError:
+            check(True, "offline, two servers' prices, no MT5_SERVER: refuses to guess")
+        os.environ["MT5_SERVER"] = "Fake-Demo"
+        try:
+            chosen, _ = fetch_mt5_hourly(universe("fx")[0], str(tmp / "mt5data"), offline=True)
+        finally:
+            os.environ.pop("MT5_SERVER")
+            other.unlink()
+            other.with_suffix(".json").unlink()
+        check(len(chosen) == 4, "offline reads MT5_SERVER's prices even when another server's are newer")
         dm.server_time = int(july.timestamp()) + 3 * 3600 - 2 * 3600 - 300   # market quiet for 2h
         _, complete = fetch_mt5_hourly(universe("fx")[0], str(tmp / "mt5data"), mt5=dm, now=july)
         check(str(complete) == "2026-07-08 09:00:00+00:00",
@@ -820,6 +837,51 @@ def main() -> int:
               and "state/done.txt" in saved_names,
               "cancelled run (SIGTERM): saves what was done and releases the lease")
 
+        from live.cloud_run import reset_feed
+        feed_bucket = tmp / "feed-bucket"
+        feed_store = cloud_state.FileStore(str(feed_bucket))
+        seed = tmp / "feed-seed"
+        for folder in ("data", "state", "models/binance", "models/Old-Demo"):
+            (seed / folder).mkdir(parents=True, exist_ok=True)
+        for name in ("mt5_Old-Demo_EUR_USD_H1.parquet", "mt5_Old-Demo_EUR_USD_H1.json",
+                     "mt5_New-Real_EUR_USD_H1.parquet", "mt5_New-Real_EUR_USD_H1.json",
+                     "BTCUSDT_1h.parquet"):
+            (seed / "data" / name).write_text("x")
+        (seed / "models" / "EUR_USD_1h_h6.pkl").write_text("trained before feeds")
+        (seed / "models" / "Old-Demo" / "EUR_USD_1h_h6.pkl").write_text("demo")
+        (seed / "models" / "binance" / "BTCUSDT_1h_h6.pkl").write_text("crypto")
+        seed_ledger = Ledger(str(seed / "state" / "ledger.db"))
+        for sym in ("EUR_USD", "XAU_USD", "BTCUSDT"):
+            seed_ledger.set_position("tsmom", "1h", sym, 1.0, 1.0, "2026-09-15T00:00:00+00:00", 1.0,
+                                     "2026-09-14T00:00:00+00:00")
+            seed_ledger.add_bar("tsmom", "1h", sym, "2026-09-15T00:00:00+00:00", 0.0, 0.0, 0.0, 0.0, 1.0)
+        seed_ledger.commit()
+        seed_ledger.conn.close()
+        feed_store.write(cloud_state.BUNDLE, cloud_state.pack(seed), 0)
+        os.environ.update(STATE_URI=f"file://{feed_bucket.as_posix()}", WORK_DIR=str(tmp / "feed-work"),
+                          MT5_SERVER="New-Real")
+        try:
+            reset_rc = reset_feed()
+        finally:
+            os.chdir(cwd)
+            for key in ("STATE_URI", "WORK_DIR", "MT5_SERVER"):
+                os.environ.pop(key, None)
+        after_dir = tmp / "feed-after"
+        cloud_state.unpack(feed_store.read(cloud_state.BUNDLE)[0], after_dir)
+        names = {q.relative_to(after_dir).as_posix() for q in after_dir.rglob("*") if q.is_file()}
+        after_ledger = Ledger(str(after_dir / "state" / "ledger.db"))
+        sleeves = sorted(r["symbol"] for r in after_ledger.conn.execute("SELECT symbol FROM positions"))
+        records = sorted(r["symbol"] for r in after_ledger.conn.execute("SELECT symbol FROM equity"))
+        after_ledger.conn.close()
+        archives = list((feed_bucket / "archive").glob("state-before-reset-*.tar.gz"))
+        check(reset_rc == 0 and len(archives) == 1
+              and {"data/mt5_New-Real_EUR_USD_H1.parquet", "data/BTCUSDT_1h.parquet",
+                   "models/binance/BTCUSDT_1h_h6.pkl"} <= names
+              and not any("Old-Demo" in n for n in names) and "models/EUR_USD_1h_h6.pkl" not in names
+              and sleeves == ["BTCUSDT"] and records == ["BTCUSDT"]
+              and feed_store.read(cloud_state.LEASE)[0] is None,
+              "reset-feed: archives first, keeps one server's prices and models, restarts FX/gold only")
+
         add_store = cloud_state.FileStore(str(tmp / "add-bucket"))
         add_root = tmp / "add-pc"
         (add_root / "data").mkdir(parents=True)
@@ -920,25 +982,68 @@ def main() -> int:
 
         print("\n[11] model retraining and paper predictions")
         from harness.data import synthetic_with_edge
-        from live.ml_job import model_paths, predict_one, train_one
+        import json
+        import sqlite3
+
+        from live.ml_job import feed_for, model_paths, predict_one, train_one
 
         btc = universe("crypto")[0]
         syn = synthetic_with_edge(3000, seed=1)
         models = str(tmp / "models")
-        line = train_one(btc, "1h", 6, syn, models, n_models=1)
-        pkl, meta = model_paths(models, btc.symbol, "1h", 6)
-        check(pkl.exists() and meta.exists() and "out-of-sample" in line,
-              "train scores walk-forward, then saves the model and its verdict")
+        line = train_one(btc, "1h", 6, syn, models, n_models=1, feed="binance")
+        pkl, meta = model_paths(models, "binance", btc.symbol, "1h", 6)
+        check(pkl.exists() and meta.exists() and "out-of-sample" in line
+              and json.loads(meta.read_text())["feed"] == "binance",
+              "train scores walk-forward, then saves the model, its verdict and its price feed")
         mled = Ledger(str(tmp / "ml.db"))
-        first = predict_one(mled, btc, "1h", 6, syn.iloc[:-10], models)
-        later = predict_one(mled, btc, "1h", 6, syn, models)
-        again = predict_one(mled, btc, "1h", 6, syn, models)
-        resolved = mled.resolved_predictions(btc.symbol, "1h")
+        first = predict_one(mled, btc, "1h", 6, syn.iloc[:-10], models, "binance")
+        later = predict_one(mled, btc, "1h", 6, syn, models, "binance")
+        again = predict_one(mled, btc, "1h", 6, syn, models, "binance")
+        resolved = mled.resolved_predictions("binance", btc.symbol, "1h")
         check(first and later and "already recorded" in again and len(resolved) == 1
               and resolved[0]["outcome"] in (0.0, 1.0) and resolved[0]["bar_ts"] == str(syn.index[-11]),
               "one prediction per bar; scored once its horizon has passed")
-        check(predict_one(mled, universe("crypto")[1], "1h", 6, syn, models) is None,
+        check(predict_one(mled, universe("crypto")[1], "1h", 6, syn, models, "binance") is None,
               "no model, no prediction")
+
+        eur = universe("fx")[0]
+        train_one(eur, "1h", 6, syn, models, n_models=1, feed="Broker-Demo")
+        on_real = predict_one(mled, eur, "1h", 6, syn, models, "Broker-Real")
+        on_demo = predict_one(mled, eur, "1h", 6, syn, models, "Broker-Demo")
+        check(on_real is None and on_demo is not None,
+              "a model trained on a demo feed is never applied to a real feed's prices")
+        check(mled.add_prediction("Broker-Real", eur.symbol, "1h", 6, str(syn.index[-1]), 0.5, "", "x")
+              and len(mled.open_predictions("Broker-Real", eur.symbol, "1h")) == 1
+              and all(r["feed"] == "Broker-Demo" for r in mled.open_predictions("Broker-Demo", eur.symbol, "1h")),
+              "the same bar predicted for two feeds: kept apart")
+        os.environ["FX_DATA_SOURCE"] = "mt5"
+        os.environ["MT5_SERVER"] = "Broker Real #1"
+        check(feed_for(eur) == "Broker_Real_1" and feed_for(btc) == "binance",
+              "feed names: the MT5 server for FX and gold, binance for crypto")
+        os.environ.pop("MT5_SERVER")
+        try:
+            feed_for(eur)
+            check(False, "an FX model without MT5_SERVER must not guess its feed")
+        except ValueError:
+            check(True, "FX model without MT5_SERVER: refuses to guess the feed")
+
+        old_db = tmp / "old-ledger.db"
+        con = sqlite3.connect(old_db)
+        con.executescript(
+            "CREATE TABLE predictions (symbol TEXT, timeframe TEXT, horizon INTEGER, bar_ts TEXT, "
+            "prob REAL NOT NULL, model_until TEXT, model_verdict TEXT, outcome REAL, fwd_return REAL, "
+            "created_at TEXT, PRIMARY KEY (symbol, timeframe, horizon, bar_ts));"
+            "INSERT INTO predictions VALUES ('EUR_USD', '1h', 6, '2026-09-15T00:00:00+00:00', 0.4, "
+            "'', 'NO EDGE', NULL, NULL, '2026-09-15');")
+        con.commit()
+        con.close()
+        migrated = Ledger(str(old_db))
+        by_feed = [tuple(r) for r in migrated.conn.execute(
+            "SELECT feed, COUNT(*) FROM predictions GROUP BY feed")]
+        unscored = migrated.open_predictions("Broker-Real", "EUR_USD", "1h")
+        migrated.conn.close()
+        check(by_feed == [("legacy", 1)] and not unscored,
+              "older predictions kept as 'legacy' and never scored against a new feed")
     finally:
         for k, val in saved_env.items():
             if val is None:

@@ -174,10 +174,38 @@ def _probe_names(mt5, resolved: str, weekend: bool = False) -> list[str]:
     return names
 
 
+def feed_name(server: str) -> str:
+    """The name one broker server's prices go by: in cache files, model folders and
+    predictions. A demo and a real server are different feeds and never mix."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", server or "mt5")
+
+
 def _cache_paths(cache_dir: str, server: str, symbol: str) -> tuple[Path, Path]:
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", server or "mt5")
-    cache = Path(cache_dir) / f"mt5_{safe}_{symbol}_H1.parquet"
+    cache = Path(cache_dir) / f"mt5_{feed_name(server)}_{symbol}_H1.parquet"
     return cache, cache.with_suffix(".json")
+
+
+def cached_servers(cache_dir: str, symbol: str) -> list[str]:
+    """Feed names that have a price file for `symbol` in `cache_dir`."""
+    suffix = f"_{symbol}_H1.parquet"
+    return sorted(p.name[len("mt5_"):-len(suffix)] for p in Path(cache_dir).glob(f"mt5_*{suffix}"))
+
+
+def _offline_cache(cache_dir: str, symbol: str) -> Path:
+    """The price file of MT5_SERVER -- never another server's, however recent."""
+    server = os.environ.get("MT5_SERVER", "")
+    if server:
+        cache = _cache_paths(cache_dir, server, symbol)[0]
+        if not cache.exists():
+            raise FileNotFoundError(f"offline, but no {feed_name(server)} prices for {symbol} ({cache})")
+        return cache
+    found = cached_servers(cache_dir, symbol)
+    if len(found) == 1:
+        return _cache_paths(cache_dir, found[0], symbol)[0]
+    if not found:
+        raise FileNotFoundError(f"offline, but no MT5 prices for {symbol} in {cache_dir}")
+    raise BrokerError(f"{symbol}: prices from several MT5 servers ({', '.join(found)}); "
+                      f"set MT5_SERVER to the one to use")
 
 
 def _history_start(now: datetime, years: float | None) -> pd.Timestamp:
@@ -232,12 +260,9 @@ def fetch_mt5_hourly(inst: Instrument, cache_dir: str = "data", offline: bool = 
     Path(cache_dir).mkdir(exist_ok=True)
     server_hint = os.environ.get("MT5_SERVER", "")
     if offline:
-        pattern = f"mt5_*_{inst.symbol}_H1.parquet"
-        found = sorted(Path(cache_dir).glob(pattern), key=lambda p: p.stat().st_mtime)
-        if not found:
-            raise FileNotFoundError(f"--offline but no MT5 cache like {Path(cache_dir) / pattern}")
-        marker = found[-1].with_suffix(".json")
-        return pd.read_parquet(found[-1]), pd.Timestamp(json.loads(marker.read_text())["complete_until"])
+        cache = _offline_cache(cache_dir, inst.symbol)
+        marker = cache.with_suffix(".json")
+        return pd.read_parquet(cache), pd.Timestamp(json.loads(marker.read_text())["complete_until"])
 
     mt5 = _terminal(mt5)
     term = _connected_terminal(mt5)
