@@ -79,7 +79,10 @@ def serve(port: int = DEFAULT_PORT) -> None:
             if name.startswith("_") or not callable(getattr(mt5, name, None)):
                 raise AttributeError(f"MetaTrader5 has no function {name!r}")
             args, kwargs = pickle.loads(payload)
-            return pickle.dumps(to_plain(getattr(mt5, name)(*args, **kwargs)))
+            fn = getattr(mt5, name)
+            # order_send rejects a call carrying a keyword dict at all, even an
+            # empty one, so only pass keywords when there are some.
+            return pickle.dumps(to_plain(fn(*args, **kwargs) if kwargs else fn(*args)))
 
         def exposed_const(self, name: str) -> bytes:
             value = getattr(mt5, name)                # AttributeError travels back as-is

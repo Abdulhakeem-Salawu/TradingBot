@@ -67,7 +67,37 @@ LEASE_TTL = timedelta(minutes=40)       # longer than the job's task timeout
 TAIL_BARS, FULL_BARS = 10_000, 100_000   # MT5 "Max bars in chart": recent bars only / whole history
 
 
+def _load_secrets() -> None:
+    """SECRETS_URI/bot.env into the environment, before anything reads a
+    credential. Settings live in a private bucket object rather than Secret
+    Manager, which bills per active version past the first six. Values already
+    set on the job win, as with live/env.py's loader.
+    """
+    uri = os.environ.get("SECRETS_URI")
+    if not uri:
+        return
+    from live.cloud_state import open_store
+    from live.env import parse_line
+
+    try:
+        data, _ = open_store(uri).read("bot.env")
+    except Exception as e:                      # never block a run on the store
+        print(f"could not read {uri}/bot.env: {type(e).__name__}: {e}")
+        return
+    if data is None:
+        print(f"no bot.env at {uri} -- MT5 and Telegram settings must come from the job")
+        return
+    names = []
+    for line in data.decode("utf-8", errors="replace").splitlines():
+        kv = parse_line(line)
+        if kv:
+            os.environ.setdefault(*kv)
+            names.append(kv[0])
+    print(f"settings from {uri}/bot.env: {', '.join(names)}")
+
+
 def _defaults() -> None:
+    _load_secrets()
     os.environ.setdefault("MT5_BACKEND", "wine")
     os.environ.setdefault("FX_DATA_SOURCE", "mt5")
     os.environ.setdefault("MT5_TERMINAL_PATH", TERMINAL_WIN)
