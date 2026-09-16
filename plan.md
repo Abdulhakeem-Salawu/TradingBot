@@ -1,6 +1,6 @@
 # Trading bot plan
 
-Last updated 2026-09-15, 22:50 UTC.
+Last updated 2026-09-16, 12:40 UTC.
 
 ## What you asked for
 
@@ -115,12 +115,12 @@ Nothing is running by hand. The bot runs by itself every hour. What's left needs
 
 ## Left for you
 
-0. **Build 20 years of Exness history on the PC (in progress, 2026-09-16).** Cloud Run can't download it: one 10-year attempt hit the 30-minute limit, because a fresh container downloads everything again and keeps it in memory. A desktop terminal does it in minutes, and the cloud then fetches only the last days.
-   - **You:** install Exness's MT5 on the PC and log in with the **investor (read-only) password**, so this PC can't trade.
-   - **You:** Tools > Options > Charts > Max. bars in chart → Unlimited, then restart MT5.
-   - **Me:** `python -m live.mt5_data --years 20`, which only downloads prices: no ledger, no orders. It reports each symbol's first bar and whether the history is complete.
-   - **Me:** `python -m live.cloud_state add --uri gs://pioneering-axe-233302-signal-bot/prod data/mt5_Exness-MT5Real10_*`. This takes the same lease as a run, so it never clashes with the schedule.
-   - **Me:** set `MT5_HISTORY_YEARS=20` on the job, run it once, and check that the run stays around 2–3 minutes and within 2 GiB.
+0. **Exness history built on the PC (done, 2026-09-16).**
+   - Exness's MT5 installed on the PC and logged in read-only; bar limit raised.
+   - `python -m live.mt5_data --years 20`: **Exness's hourly history starts on 2014-01-14**, about 12.7 years (about 60,200 bars per FX pair, 57,300 for gold). All 8 symbols are marked complete, so nothing older exists at this broker.
+   - Uploaded into the prod state with `python -m live.cloud_state add` (under the lease). Since then the cloud runs fetch only the latest days: no "history to download", about 2 minutes, peak about 1.5 GB.
+   - Cloud `MT5_HISTORY_YEARS` stays at 2: deep history comes from the PC, and a new instrument downloads only 2 years in the cloud.
+   - Gold uses `MT5_SYMBOLS=XAU_USD:XAUUSDm` (Exness also lists `XAUUSD247m`).
 
 1. **Press Start in @FxCurrencyBot** (Telegram). A bot cannot write to you until you write to it. Tell me when done and I finish the wiring: chat id on both jobs, then a test message.
 2. **Change the MT5 demo password.** It was pasted in chat.
