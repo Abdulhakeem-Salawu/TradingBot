@@ -1027,6 +1027,30 @@ def main() -> int:
         except ValueError:
             check(True, "FX model without MT5_SERVER: refuses to guess the feed")
 
+        # --- the prediction scoreboard ---
+        from live.ml_job import report_lines
+
+        os.environ["MT5_SERVER"] = "Broker Real #1"
+        empty = report_lines([(btc, "1h")], str(tmp / "empty-report.db"))
+        check(any("Nothing has resolved yet" in ln for ln in empty)
+              and any("no resolved predictions yet" in ln for ln in empty),
+              "report: says plainly that nothing has resolved rather than showing blank columns")
+
+        sdb = tmp / "scoreboard.db"
+        sled = Ledger(str(sdb))
+        # 6 LONG calls, 4 right; 4 flat calls, 3 right -> 7/10 accuracy, majority is 5/10
+        rows = [(0.8, 1.0)] * 4 + [(0.8, 0.0)] * 2 + [(0.2, 0.0)] * 3 + [(0.2, 1.0)] * 1
+        for i, (prob, outcome) in enumerate(rows):
+            ts = f"2026-01-0{i + 1} 00:00:00+00:00"
+            sled.add_prediction("binance", btc.symbol, "1h", 6, ts, prob, "2025-12-31", "NO EDGE")
+            sled.resolve_prediction("binance", btc.symbol, "1h", 6, ts, outcome, 0.001)
+        sled.commit()
+        line = [ln for ln in report_lines([(btc, "1h")], str(sdb)) if ln.startswith(btc.symbol)][0]
+        check("70.0%" in line and "50.0%" in line and "+20.0%" in line,
+              "report: accuracy counts flat calls too, and lift is measured against the majority")
+        check("66.7%" in line,
+              "report: hit rate covers the LONG calls alone (4 of 6)")
+
         # --- the reserved holdout ---
         from live.ml_job import holdout_one, holdout_start, split_at_holdout, training_frame
 

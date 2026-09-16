@@ -19,7 +19,7 @@ hourly:
      (live/mt5_bridge.py), then wait until the bridge can initialize();
   3. run every paper job (live/run_jobs.py). If MT5 did not come up, jobs that
      need it are skipped rather than each waiting for an IPC timeout;
-  4. at COMPARE_HOUR_UTC, send the daily comparison;
+  4. at COMPARE_HOUR_UTC, send the daily comparison and the model hit rates;
   5. record model predictions if models/ has any (live/ml_job.py, paper only);
   6. with EXECUTOR_ENABLED=true only, sync the demo/live slots to MT5;
   7. save the state (refused if another run changed it), keep a daily backup,
@@ -584,6 +584,15 @@ def hourly_work(root: Path, now: datetime, clock: Clock) -> int:
             if code:
                 problem(f"model predictions (exit {code})", echo=False)
             rc |= code
+            # Once a day, alongside the strategy comparison: how the models' own
+            # calls have actually turned out, so their hit rate is visible without
+            # anyone running a command.
+            if compare:
+                code = subprocess.run([sys.executable, "-m", "live.ml_job",
+                                       "report", "--send"]).returncode
+                if code:
+                    problem(f"model report (exit {code})", echo=False)
+                rc |= code
             clock.lap("predictions")
 
         if trading and ready:

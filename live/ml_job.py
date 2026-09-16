@@ -249,27 +249,55 @@ def predict(targets, horizon: int, cache_dir: str, model_dir: str, db: str) -> i
     return 1 if failures else 0
 
 
-def report(targets, db: str) -> int:
+def report_lines(targets, db: str) -> list[str]:
+    """How the recorded predictions have actually done, per model.
+
+    accuracy is the share of calls that matched -- LONG calls where a long did
+    beat the round-trip cost, and flat calls where it did not. The baseline is
+    always calling the majority class, so lift is what the model adds over
+    guessing. hit rate looks at the LONG calls alone, which is the half that
+    would have cost money.
+    """
     ledger = Ledger(db)
-    print(f"{'symbol':<8} {'tf':<3} {'feed':<18} {'resolved':>8} {'LONG calls':>10} {'hit rate':>8} "
-          f"{'base rate':>9} {'avg fwd when LONG':>17}")
+    lines = [f"{'symbol':<8} {'tf':<3} {'resolved':>8} {'LONG':>5} {'accuracy':>9} "
+             f"{'baseline':>9} {'lift':>7} {'hit rate':>9} {'base rate':>10}"]
+    waiting, total = [], 0
     for inst, tf in targets:
         try:
             feed = feed_for(inst)
         except ValueError as e:
-            print(e)
+            lines.append(str(e))
             continue
         rows = ledger.resolved_predictions(feed, inst.symbol, tf, limit=5000)
         if not rows:
+            waiting.append(inst.symbol)
             continue
-        outcome = np.array([r["outcome"] for r in rows])
+        total += len(rows)
+        outcome = np.array([r["outcome"] for r in rows], dtype=float)
         calls = np.array([r["prob"] >= 0.5 for r in rows])
-        fwd = np.array([r["fwd_return"] for r in rows])
+        accuracy = float((calls == (outcome > 0.5)).mean())
+        base = float(max(outcome.mean(), 1.0 - outcome.mean()))   # always guess the majority
         hit = f"{outcome[calls].mean():.1%}" if calls.any() else "-"
-        avg = f"{fwd[calls].mean():+.3%}" if calls.any() else "-"
-        print(f"{inst.symbol:<8} {tf:<3} {feed:<18} {len(rows):>8} {int(calls.sum()):>10} {hit:>8} "
-              f"{outcome.mean():>9.1%} {avg:>17}")
-    print("hit rate = share of LONG calls that beat the round-trip cost; compare with base rate.")
+        lines.append(f"{inst.symbol:<8} {tf:<3} {len(rows):>8} {int(calls.sum()):>5} "
+                     f"{accuracy:>9.1%} {base:>9.1%} {accuracy - base:>+7.1%} {hit:>9} "
+                     f"{outcome.mean():>10.1%}")
+    if waiting:
+        lines.append(f"no resolved predictions yet: {', '.join(waiting)}")
+    if not total:
+        lines.append("Nothing has resolved yet. Each prediction needs its horizon to pass "
+                     "(ML_HORIZON bars), so the first numbers appear a few hours after training.")
+    lines.append("accuracy counts LONG and flat calls; lift is accuracy minus the baseline. "
+                 "Predictions are paper only and never traded.")
+    return lines
+
+
+def report(targets, db: str, send_it: bool = False) -> int:
+    text = "\n".join(["MODEL PREDICTIONS"] + report_lines(targets, db))
+    print(text)
+    if send_it:
+        from live.notify import send
+
+        send(text, pre=True)     # monospace, so the columns line up in Telegram
     return 0
 
 
@@ -330,6 +358,7 @@ def main() -> int:
     ap.add_argument("--model-dir", default=MODEL_DIR)
     ap.add_argument("--db", default="state/ledger.db")
     ap.add_argument("--offline", action="store_true", help="train on cached prices only")
+    ap.add_argument("--send", action="store_true", help="report: also send it to Telegram")
     ap.add_argument("--env-file", default=".env")
     a = ap.parse_args()
     warnings.filterwarnings("ignore")
@@ -346,7 +375,7 @@ def main() -> int:
         return holdout(targets, horizon, a.cache_dir, a.offline, a.model_dir)
     if a.task == "predict":
         return predict(targets, horizon, a.cache_dir, a.model_dir, a.db)
-    return report(targets, a.db)
+    return report(targets, a.db, a.send)
 
 
 if __name__ == "__main__":
